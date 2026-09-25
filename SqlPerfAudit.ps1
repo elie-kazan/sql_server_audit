@@ -1,30 +1,34 @@
 <#
 .SYNOPSIS
-    Read-only SQL Server performance health check that writes a Word (.docx) report.
+    Audit de performance SQL Server en lecture seule, avec rapport Word (.docx) en français.
 
 .DESCRIPTION
-    Connects to one or more SQL Server instances, runs read-only diagnostic queries
-    (DMVs and system catalogs), and produces one Word report per instance listing the
-    problems worth looking at, ranked by severity, with a recommendation for each.
+    Se connecte à une ou plusieurs instances SQL Server, exécute des requêtes de diagnostic
+    en lecture seule (DMV et catalogues système) et produit un rapport Word par instance,
+    listant les problèmes qui méritent attention, classés par gravité, avec une
+    recommandation pour chacun.
 
-    Nothing to install: uses only .NET classes that ship with Windows PowerShell 5.1
-    (also works in PowerShell 7). No Office, Python or modules required.
-    Nothing is changed on the audited server.
+    Aucune installation : utilise uniquement des classes .NET fournies avec Windows
+    PowerShell 5.1 (fonctionne aussi avec PowerShell 7). Ni Office, ni Python, ni module.
+    Rien n'est modifié sur le serveur audité.
 
-    Permissions needed: VIEW SERVER STATE (sysadmin not required) and read access to
-    msdb backup history.
+    Droits nécessaires : VIEW SERVER STATE et VIEW ANY DEFINITION (sysadmin inutile),
+    plus la lecture de l'historique de sauvegarde (msdb.dbo.backupset).
+
+    IMPORTANT : ce fichier doit rester enregistré en UTF-8 avec BOM, sinon Windows
+    PowerShell 5.1 corrompt les accents du rapport.
 
 .PARAMETER SqlInstance
-    One or more instances: SERVER, SERVER\INSTANCE or SERVER,PORT.
+    Une ou plusieurs instances : SERVEUR, SERVEUR\INSTANCE ou SERVEUR,PORT.
 
 .PARAMETER Credential
-    SQL login (use Get-Credential). Omit to use Windows authentication.
+    Login SQL (via Get-Credential). Sans ce paramètre, l'authentification Windows est utilisée.
 
 .PARAMETER OutputFolder
-    Where to write the reports. Default: current folder.
+    Dossier des rapports. Par défaut : le dossier courant.
 
 .PARAMETER Top
-    Number of rows in "top" tables (queries, missing indexes, files). Default 10.
+    Nombre de lignes des tableaux « top » (attentes, requêtes, fichiers, index). Défaut : 10.
 
 .EXAMPLE
     .\Invoke-SqlPerfAudit.ps1 -SqlInstance SQLPROD01
@@ -36,7 +40,7 @@
     .\Invoke-SqlPerfAudit.ps1 -SqlInstance SQLPROD01 -Credential (Get-Credential) -TrustServerCertificate
 
 .NOTES
-    If the script is blocked by execution policy, run it with:
+    Si la stratégie d'exécution bloque le script :
     powershell.exe -ExecutionPolicy Bypass -File .\Invoke-SqlPerfAudit.ps1 -SqlInstance SQLPROD01
 #>
 [CmdletBinding()]
@@ -53,10 +57,11 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Data
 Add-Type -AssemblyName System.IO.Compression
 $script:Inv = [System.Globalization.CultureInfo]::InvariantCulture
-$script:ScriptVersion = '1.0'
+$script:Fr = [System.Globalization.CultureInfo]::GetCultureInfo('fr-FR')
+$script:ScriptVersion = '1.1'
 
 # =============================================================================
-# General helpers
+# Fonctions utilitaires
 # =============================================================================
 
 function Get-ShortError($Err) {
@@ -68,17 +73,18 @@ function Get-ShortError($Err) {
     return $m
 }
 
-function Format-N0($v) { if ($null -eq $v) { return '' }; return ([double]$v).ToString('N0', $script:Inv) }
-function Format-N1($v) { if ($null -eq $v) { return '' }; return ([double]$v).ToString('N1', $script:Inv) }
+function Format-N0($v) { if ($null -eq $v) { return '' }; return ([double]$v).ToString('N0', $script:Fr) }
+function Format-N1($v) { if ($null -eq $v) { return '' }; return ([double]$v).ToString('N1', $script:Fr) }
+function Format-Date($v) { if ($null -eq $v) { return '' }; return ([datetime]$v).ToString('dd/MM/yyyy HH:mm', $script:Fr) }
 
 function Format-Value($v) {
     if ($null -eq $v) { return '' }
-    if ($v -is [bool]) { if ($v) { return 'Yes' } else { return 'No' } }
-    if ($v -is [datetime]) { return $v.ToString('yyyy-MM-dd HH:mm', $script:Inv) }
-    if ($v -is [int] -or $v -is [long] -or $v -is [int16] -or $v -is [byte]) { return ([long]$v).ToString('N0', $script:Inv) }
+    if ($v -is [bool]) { if ($v) { return 'Oui' } else { return 'Non' } }
+    if ($v -is [datetime]) { return (Format-Date $v) }
+    if ($v -is [int] -or $v -is [long] -or $v -is [int16] -or $v -is [byte]) { return ([long]$v).ToString('N0', $script:Fr) }
     if ($v -is [decimal] -or $v -is [double] -or $v -is [single]) {
-        if ([math]::Abs([double]$v) -ge 1000) { return ([double]$v).ToString('N0', $script:Inv) }
-        return ([double]$v).ToString('N1', $script:Inv)
+        if ([math]::Abs([double]$v) -ge 1000) { return ([double]$v).ToString('N0', $script:Fr) }
+        return ([double]$v).ToString('N1', $script:Fr)
     }
     $s = [string]$v
     if ($s.Length -gt 400) { $s = $s.Substring(0, 397) + '...' }
@@ -92,7 +98,7 @@ function Test-Numeric($v) {
 function Join-Names($Names, [int]$Max = 6) {
     $n = @($Names)
     if ($n.Count -le $Max) { return ($n -join ', ') }
-    return (($n[0..($Max - 1)] -join ', ') + ' and ' + ($n.Count - $Max) + ' more')
+    return (($n[0..($Max - 1)] -join ', ') + ' et ' + ($n.Count - $Max) + ' autre(s)')
 }
 
 function Format-QueryText([string]$Text) {
@@ -103,7 +109,7 @@ function Format-QueryText([string]$Text) {
 }
 
 # =============================================================================
-# SQL access
+# Accès SQL Server
 # =============================================================================
 
 function Connect-Instance([string]$Instance) {
@@ -126,8 +132,8 @@ function Connect-Instance([string]$Instance) {
     return $c
 }
 
-# Runs a query and returns rows as objects (DBNull converted to $null).
-# Always call as @(Invoke-Q ...) so a single row is still an array.
+# Exécute une requête et renvoie les lignes sous forme d'objets (DBNull converti en $null).
+# Toujours appeler sous la forme @(Invoke-Q ...) pour obtenir un tableau même avec une seule ligne.
 function Invoke-Q([string]$Sql) {
     $cmd = $script:Conn.CreateCommand()
     $cmd.CommandText = "SET NOCOUNT ON;`r`n" + $Sql
@@ -157,8 +163,11 @@ function Get-One([string]$Sql) {
 }
 
 # =============================================================================
-# Findings, sections, tables
+# Constats, sections, tableaux
 # =============================================================================
+
+# Gravité interne (High/Medium/Low/Info) et libellé affiché en français.
+$script:SevLabel = @{ High = 'Élevée'; Medium = 'Moyenne'; Low = 'Faible'; Info = 'Info' }
 
 function Add-Finding([string]$Severity, [string]$Title, [string]$Detail, [string]$Fix) {
     [void]$script:Findings.Add([pscustomobject]@{
@@ -190,16 +199,16 @@ function Invoke-Check([string]$Title, [string]$Intro, [scriptblock]$Body) {
         & $Body
     } catch {
         $sec.Error = Get-ShortError $_
-        Write-Warning ('    ' + $Title + ' could not run: ' + $sec.Error)
+        Write-Warning ('    ' + $Title + " n'a pas pu s'exécuter : " + $sec.Error)
     }
     [void]$script:Sections.Add($sec)
 }
 
 # =============================================================================
-# Reference data
+# Données de référence
 # =============================================================================
 
-# Waits that are normal background activity and are ignored.
+# Attentes correspondant à une activité de fond normale : ignorées.
 $script:BenignWaits = @(
     'BROKER_EVENTHANDLER','BROKER_RECEIVE_WAITFOR','BROKER_TASK_STOP','BROKER_TO_FLUSH','BROKER_TRANSMITTER',
     'CHECKPOINT_QUEUE','CHKPT','CLR_AUTO_EVENT','CLR_MANUAL_EVENT','CLR_SEMAPHORE','CXCONSUMER',
@@ -219,28 +228,28 @@ $script:BenignWaits = @(
 )
 $script:BenignPrefixes = @('SLEEP_', 'QDS_', 'PREEMPTIVE_XE_', 'XE_', 'BROKER_')
 
-# Plain-language meaning of common waits (matched by prefix, first match wins).
+# Signification des attentes courantes (recherche par préfixe, la première correspondance l'emporte).
 $script:WaitInfo = @(
-    @{ P = 'THREADPOOL';        M = 'Worker thread starvation: requests waited for a thread. Can cause timeouts and apparent freezes.'; F = 'Find the cause (usually heavy blocking or excessive parallelism). Do not simply raise max worker threads.' },
-    @{ P = 'RESOURCE_SEMAPHORE';M = 'Queries waited for memory (sorts, hash joins) before they could start.'; F = 'Tune queries with large memory grants (missing indexes, bad estimates) and check memory settings.' },
-    @{ P = 'CX';                M = 'Parallelism: threads of parallel queries waiting for each other.'; F = 'Check MAXDOP and cost threshold for parallelism, then tune the largest parallel queries.' },
-    @{ P = 'SOS_SCHEDULER_YIELD'; M = 'CPU pressure: threads used their full CPU time slice, often from scanning data in memory.'; F = 'Tune the top CPU queries (see Top queries) and look for scans that indexes could avoid.' },
-    @{ P = 'PAGEIOLATCH_';      M = 'Reading data pages from disk into memory.'; F = 'Check disk read latency and memory pressure; reduce data read by indexing and query tuning.' },
-    @{ P = 'WRITELOG';          M = 'Commits waiting for the transaction log to be written to disk.'; F = 'Check log file write latency; put logs on fast storage; avoid many tiny transactions.' },
-    @{ P = 'LCK_M_';            M = 'Blocking: sessions waiting for locks held by others.'; F = 'Find blocking chains and long transactions; consider READ_COMMITTED_SNAPSHOT; index to shorten locks.' },
-    @{ P = 'PAGELATCH_';        M = 'Contention on hot pages in memory, often tempdb allocation pages.'; F = 'Check tempdb file count; consider OPTIMIZE_FOR_SEQUENTIAL_KEY for hot insert tables.' },
-    @{ P = 'ASYNC_NETWORK_IO';  M = 'SQL Server waited for the client application to consume results.'; F = 'Usually an application issue (large result sets read row by row, slow app server).' },
-    @{ P = 'HADR_SYNC_COMMIT';  M = 'Commits waiting for synchronous Availability Group replicas.'; F = 'Check network and disk latency on secondary replicas.' },
-    @{ P = 'IO_COMPLETION';     M = 'Non-data I/O such as sort/hash spills to tempdb.'; F = 'Look for tempdb spills and storage latency.' },
-    @{ P = 'ASYNC_IO_COMPLETION'; M = 'Backups, file growth and bulk I/O.'; F = 'Check backup schedule; enable instant file initialization; pre-size files.' },
-    @{ P = 'BACKUP';            M = 'Backup activity.'; F = 'Normal during backups; schedule outside peak hours.' },
-    @{ P = 'OLEDB';             M = 'Linked server calls or some DBCC/monitoring activity.'; F = 'Review linked server queries.' },
-    @{ P = 'PREEMPTIVE_';       M = 'Calls out to the operating system (authentication, file operations, CLR).'; F = 'Identify the specific call; often Active Directory or file system latency.' }
+    @{ P = 'THREADPOOL';          M = "Pénurie de threads de travail : des requêtes ont attendu un thread. Peut provoquer des délais d'attente et un serveur qui semble figé."; F = "Trouver la cause (le plus souvent des blocages importants ou un parallélisme excessif). Ne pas se contenter d'augmenter max worker threads." },
+    @{ P = 'RESOURCE_SEMAPHORE';  M = "Des requêtes ont attendu de la mémoire (tris, jointures de hachage) avant de pouvoir démarrer."; F = "Optimiser les requêtes qui demandent beaucoup de mémoire (index manquants, mauvaises estimations) et vérifier la configuration mémoire." },
+    @{ P = 'CX';                  M = "Parallélisme : les threads d'une requête parallèle s'attendent les uns les autres."; F = "Vérifier MAXDOP et cost threshold for parallelism, puis optimiser les plus grosses requêtes parallèles." },
+    @{ P = 'SOS_SCHEDULER_YIELD'; M = "Pression CPU : des threads ont épuisé leur quantum de temps processeur, souvent en parcourant des données en mémoire."; F = "Optimiser les requêtes les plus consommatrices de CPU (voir Requêtes les plus coûteuses) et chercher les parcours qu'un index pourrait éviter." },
+    @{ P = 'PAGEIOLATCH_';        M = "Lecture de pages de données depuis le disque vers la mémoire."; F = "Vérifier la latence de lecture des disques et la pression mémoire ; réduire le volume lu grâce à l'indexation et à l'optimisation des requêtes." },
+    @{ P = 'WRITELOG';            M = "Validations de transactions en attente de l'écriture du journal sur disque."; F = "Vérifier la latence d'écriture des fichiers journaux ; les placer sur un stockage rapide ; éviter les très nombreuses petites transactions." },
+    @{ P = 'LCK_M_';              M = "Blocages : des sessions attendent des verrous détenus par d'autres sessions."; F = "Identifier les chaînes de blocage et les transactions longues ; envisager READ_COMMITTED_SNAPSHOT ; indexer pour raccourcir la durée des verrous." },
+    @{ P = 'PAGELATCH_';          M = "Contention sur des pages très sollicitées en mémoire, souvent les pages d'allocation de tempdb."; F = "Vérifier le nombre de fichiers de tempdb ; envisager OPTIMIZE_FOR_SEQUENTIAL_KEY pour les tables à insertions intensives." },
+    @{ P = 'ASYNC_NETWORK_IO';    M = "SQL Server a attendu que l'application cliente lise les résultats."; F = "Généralement un problème applicatif (gros jeux de résultats lus ligne à ligne, serveur d'application lent)." },
+    @{ P = 'HADR_SYNC_COMMIT';    M = "Validations en attente des réplicas synchrones du groupe de disponibilité."; F = "Vérifier la latence réseau et disque des réplicas secondaires." },
+    @{ P = 'IO_COMPLETION';       M = "E/S hors pages de données, par exemple des débordements de tris ou de hachages dans tempdb."; F = "Rechercher les débordements vers tempdb et vérifier la latence du stockage." },
+    @{ P = 'ASYNC_IO_COMPLETION'; M = "Sauvegardes, croissance de fichiers et E/S en masse."; F = "Vérifier le planning des sauvegardes ; activer l'initialisation instantanée des fichiers ; pré-dimensionner les fichiers." },
+    @{ P = 'BACKUP';              M = "Activité de sauvegarde."; F = "Normal pendant les sauvegardes ; les planifier en dehors des heures de pointe." },
+    @{ P = 'OLEDB';               M = "Appels à des serveurs liés, ou certaines activités DBCC ou de supervision."; F = "Examiner les requêtes qui passent par des serveurs liés." },
+    @{ P = 'PREEMPTIVE_';         M = "Appels au système d'exploitation (authentification, opérations sur fichiers, CLR)."; F = "Identifier l'appel concerné ; souvent une latence Active Directory ou du système de fichiers." }
 )
 
 function Get-WaitInfo([string]$WaitType) {
     foreach ($w in $script:WaitInfo) { if ($WaitType.StartsWith($w.P)) { return $w } }
-    return @{ P = ''; M = 'Less common wait type; see Microsoft documentation.'; F = 'Investigate if it stays near the top.' }
+    return @{ P = ''; M = "Type d'attente moins courant ; voir la documentation Microsoft."; F = "À examiner s'il reste en tête du classement." }
 }
 
 function Test-BenignWait([string]$WaitType) {
@@ -250,7 +259,7 @@ function Test-BenignWait([string]$WaitType) {
 }
 
 function Get-RecommendedMaxMemoryMB([double]$PhysMB) {
-    # Common starting point: keep 1 GB for the OS, +1 GB per 4 GB from 4-16 GB, +1 GB per 8 GB above 16 GB.
+    # Point de départ courant : 1 Go pour l'OS, +1 Go par 4 Go entre 4 et 16 Go, +1 Go par 8 Go au-delà de 16 Go.
     $gb = $PhysMB / 1024
     $reserve = 1 + [math]::Min([math]::Max($gb - 4, 0), 12) / 4 + [math]::Max($gb - 16, 0) / 8
     return [math]::Max([math]::Floor(($gb - $reserve) * 1024), [math]::Floor($PhysMB / 2))
@@ -264,7 +273,7 @@ function Get-RecommendedMaxDop([int]$PerNode, [int]$Nodes) {
 }
 
 # =============================================================================
-# Checks
+# Vérifications
 # =============================================================================
 
 function Test-Instance {
@@ -313,35 +322,34 @@ FROM sys.dm_os_schedulers
     $script:Ctx.UptimeDays = $uptime.TotalDays
     $script:Ctx.StartTime  = [datetime]$si.sqlserver_start_time
     $script:Ctx.AuditLogin = [string]$p.AuditLogin
-    $script:Ctx.MaxWorkers = $si.max_workers_count
 
-    $uptimeText = ([int][math]::Floor($uptime.TotalDays)).ToString() + ' days ' + $uptime.Hours + ' h'
+    $uptimeText = ([int][math]::Floor($uptime.TotalDays)).ToString() + ' jours ' + $uptime.Hours + ' h'
     $rows = @(
-        [pscustomobject]@{ Property = 'Server';           Value = $p.ServerName },
-        [pscustomobject]@{ Property = 'Version';          Value = $script:Ctx.Version },
-        [pscustomobject]@{ Property = 'Edition';          Value = $p.Edition },
-        [pscustomobject]@{ Property = 'Logical CPUs used by SQL'; Value = ([string]$online + ' (' + $nodes + ' NUMA node(s))') },
-        [pscustomobject]@{ Property = 'Physical memory';  Value = ((Format-N0 $physMB) + ' MB') },
-        [pscustomobject]@{ Property = 'Virtual machine';  Value = [string]$si.virtual_machine_type_desc },
-        [pscustomobject]@{ Property = 'Started';          Value = $si.sqlserver_start_time },
-        [pscustomobject]@{ Property = 'Uptime';           Value = $uptimeText },
-        [pscustomobject]@{ Property = 'Instant file initialization'; Value = $(if ($ifi -eq 'Y') { 'Enabled' } elseif ($ifi -eq 'N') { 'Disabled' } else { 'Unknown' }) }
+        [pscustomobject]@{ 'Propriété' = 'Serveur';                       'Valeur' = $p.ServerName },
+        [pscustomobject]@{ 'Propriété' = 'Version';                       'Valeur' = $script:Ctx.Version },
+        [pscustomobject]@{ 'Propriété' = 'Édition';                       'Valeur' = $p.Edition },
+        [pscustomobject]@{ 'Propriété' = 'Processeurs utilisés par SQL Server'; 'Valeur' = ([string]$online + ' (' + $nodes + ' nœud(s) NUMA)') },
+        [pscustomobject]@{ 'Propriété' = 'Mémoire physique';              'Valeur' = ((Format-N0 $physMB) + ' Mo') },
+        [pscustomobject]@{ 'Propriété' = 'Machine virtuelle';             'Valeur' = [string]$si.virtual_machine_type_desc },
+        [pscustomobject]@{ 'Propriété' = 'Démarré le';                    'Valeur' = $si.sqlserver_start_time },
+        [pscustomobject]@{ 'Propriété' = 'Durée de fonctionnement';       'Valeur' = $uptimeText },
+        [pscustomobject]@{ 'Propriété' = 'Initialisation instantanée des fichiers'; 'Valeur' = $(if ($ifi -eq 'Y') { 'Activée' } elseif ($ifi -eq 'N') { 'Désactivée' } else { 'Inconnue' }) }
     )
-    Add-Table 'Instance summary' $rows @(1, 2)
+    Add-Table "Résumé de l'instance" $rows @(1, 2)
 
     if ($major -ge 10 -and $major -le 13) {
-        Add-Finding 'Medium' ($verName + ' is out of Microsoft extended support') 'No more security or performance fixes are released for this version (SQL Server 2016 support ended in July 2026).' 'Plan an upgrade to a supported version.'
+        Add-Finding 'Medium' ($verName + " n'est plus couvert par le support étendu de Microsoft") "Aucun correctif de sécurité ou de performance n'est plus publié pour cette version (le support de SQL Server 2016 a pris fin en juillet 2026)." "Planifier une migration vers une version supportée."
     } elseif ($major -eq 14) {
-        Add-Finding 'Info' 'SQL Server 2017 extended support ends in October 2027' 'After that date no more fixes are released.' 'Start planning the upgrade.'
+        Add-Finding 'Info' "Le support étendu de SQL Server 2017 prend fin en octobre 2027" "Après cette date, plus aucun correctif ne sera publié." "Commencer à planifier la migration."
     }
     if ($offline -gt 0) {
-        Add-Finding 'High' ([string]$offline + ' CPU(s) cannot be used by SQL Server') 'Some schedulers are VISIBLE OFFLINE, usually because of edition licensing limits or the VM socket/core layout.' 'Check the edition CPU limit and reconfigure the VM with fewer sockets and more cores per socket, or change edition.'
+        Add-Finding 'High' ([string]$offline + ' processeur(s) inutilisable(s) par SQL Server') "Certains ordonnanceurs sont VISIBLE OFFLINE, généralement à cause d'une limite de licence de l'édition ou de la topologie sockets/cœurs de la machine virtuelle." "Vérifier la limite de processeurs de l'édition et reconfigurer la VM avec moins de sockets et plus de cœurs par socket, ou changer d'édition."
     }
     if ($ifi -eq 'N') {
-        Add-Finding 'Medium' 'Instant file initialization is disabled' 'Data file growth and restores must zero out new space, which stalls activity during autogrowth.' 'Grant the SQL Server service account the "Perform volume maintenance tasks" right and restart the service.'
+        Add-Finding 'Medium' "L'initialisation instantanée des fichiers est désactivée" "Chaque croissance de fichier de données et chaque restauration doivent remettre l'espace à zéro, ce qui bloque l'activité pendant les croissances automatiques." "Accorder au compte de service SQL Server le droit « Effectuer les tâches de maintenance de volume », puis redémarrer le service."
     }
     if ($uptime.TotalDays -lt 7) {
-        Add-Finding 'Info' ('SQL Server was restarted ' + (Format-N1 $uptime.TotalDays) + ' days ago') 'Most statistics in this report accumulate since the last restart, so they may not reflect a typical week.' 'Re-run the audit after a full business cycle for a more reliable picture.'
+        Add-Finding 'Info' ('SQL Server a redémarré il y a ' + (Format-N1 $uptime.TotalDays) + ' jours') "La plupart des statistiques de ce rapport sont cumulées depuis le dernier redémarrage : elles peuvent ne pas refléter une semaine type." "Relancer l'audit après un cycle d'activité complet pour une image plus fiable."
     }
 }
 
@@ -359,15 +367,14 @@ WHERE name IN (N'max server memory (MB)', N'min server memory (MB)', N'max degre
 
     $phys = [double]$script:Ctx.PhysMB
     $maxMem = [long]$cfg['max server memory (MB)'].value_in_use
-    $script:Ctx.MaxMemDefault = ($maxMem -ge 2147483647)
     if ($phys -gt 0) {
         $rec = Get-RecommendedMaxMemoryMB $phys
         if ($maxMem -ge 2147483647) {
-            $assess['max server memory (MB)'] = 'Not set (unlimited)'
-            Add-Finding 'High' 'Max server memory is not configured' ('It is unlimited on a server with ' + (Format-N0 $phys) + ' MB of RAM, so SQL Server can starve the operating system, causing paging and instability.') ('Set max server memory to about ' + (Format-N0 $rec) + ' MB as a starting point, then keep an eye on free OS memory.')
+            $assess['max server memory (MB)'] = 'Non défini (illimité)'
+            Add-Finding 'High' "La mémoire maximale du serveur (max server memory) n'est pas configurée" ('Elle est illimitée sur un serveur de ' + (Format-N0 $phys) + " Mo de RAM : SQL Server peut priver le système d'exploitation de mémoire, ce qui provoque de la pagination et de l'instabilité.") ('Définir max server memory à environ ' + (Format-N0 $rec) + " Mo comme point de départ, puis surveiller la mémoire libre du système.")
         } elseif ($maxMem -gt ($phys - ($phys - $rec) / 2)) {
-            $assess['max server memory (MB)'] = 'Leaves little for the OS'
-            Add-Finding 'Medium' 'Max server memory leaves little room for the operating system' ('It is ' + (Format-N0 $maxMem) + ' MB out of ' + (Format-N0 $phys) + ' MB of RAM.') ('Lower it to about ' + (Format-N0 $rec) + ' MB unless you have verified the OS keeps enough free memory.')
+            $assess['max server memory (MB)'] = 'Laisse peu de mémoire au système'
+            Add-Finding 'Medium' "La mémoire maximale du serveur laisse peu de place au système d'exploitation" ('Elle est de ' + (Format-N0 $maxMem) + ' Mo sur ' + (Format-N0 $phys) + ' Mo de RAM.') ('La réduire à environ ' + (Format-N0 $rec) + " Mo, sauf si vous avez vérifié que le système garde assez de mémoire libre.")
         } else {
             $assess['max server memory (MB)'] = 'OK'
         }
@@ -377,59 +384,59 @@ WHERE name IN (N'max server memory (MB)', N'min server memory (MB)', N'max degre
     $cpu = [int]$script:Ctx.CpuCount
     $recDop = Get-RecommendedMaxDop $script:Ctx.PerNode $script:Ctx.Nodes
     if ($maxdop -eq 0 -and $cpu -gt 8) {
-        $assess['max degree of parallelism'] = ('Unlimited on ' + $cpu + ' CPUs; suggest ' + $recDop)
-        Add-Finding 'Medium' 'MAXDOP is unlimited' ('With ' + $cpu + ' logical CPUs, a single query can use all of them, hurting concurrency.') ('Set max degree of parallelism to ' + $recDop + ' (Microsoft guidance for this CPU/NUMA layout).')
+        $assess['max degree of parallelism'] = ('Illimité sur ' + $cpu + ' processeurs ; suggéré : ' + $recDop)
+        Add-Finding 'Medium' 'MAXDOP est illimité' ('Avec ' + $cpu + ' processeurs logiques, une seule requête peut tous les utiliser, au détriment des autres utilisateurs.') ('Définir max degree of parallelism à ' + $recDop + ' (recommandation Microsoft pour cette topologie CPU/NUMA).')
     } elseif ($maxdop -gt $recDop) {
-        $assess['max degree of parallelism'] = ('Higher than suggested ' + $recDop)
-        Add-Finding 'Low' 'MAXDOP is higher than recommended' ('Current ' + $maxdop + ', suggested ' + $recDop + ' for this CPU/NUMA layout.') ('Consider lowering MAXDOP to ' + $recDop + '.')
+        $assess['max degree of parallelism'] = ('Supérieur à la valeur suggérée (' + $recDop + ')')
+        Add-Finding 'Low' 'MAXDOP est supérieur à la recommandation' ('Valeur actuelle : ' + $maxdop + ' ; valeur suggérée pour cette topologie CPU/NUMA : ' + $recDop + '.') ('Envisager de réduire MAXDOP à ' + $recDop + '.')
     } elseif ($maxdop -eq 1 -and $cpu -gt 1) {
-        $assess['max degree of parallelism'] = 'Parallelism disabled'
-        Add-Finding 'Info' 'Parallelism is disabled (MAXDOP 1)' 'Large queries cannot use more than one CPU. This is required by some applications (e.g. SharePoint) but slows reporting-type queries.' ('Keep it if the application vendor requires it; otherwise consider MAXDOP ' + $recDop + ' with a higher cost threshold.')
+        $assess['max degree of parallelism'] = 'Parallélisme désactivé'
+        Add-Finding 'Info' 'Le parallélisme est désactivé (MAXDOP 1)' "Les requêtes lourdes ne peuvent utiliser qu'un seul processeur. Certaines applications l'exigent (SharePoint par exemple), mais cela ralentit les requêtes de type reporting." ("Le conserver si l'éditeur de l'application l'exige ; sinon, envisager MAXDOP " + $recDop + ' avec un seuil de coût plus élevé.')
     } else {
         $assess['max degree of parallelism'] = 'OK'
     }
 
     $ctfp = [long]$cfg['cost threshold for parallelism'].value_in_use
     if ($ctfp -le 5) {
-        $assess['cost threshold for parallelism'] = 'Default (5) is too low'
-        Add-Finding 'Medium' 'Cost threshold for parallelism is at the default of 5' 'Even cheap queries go parallel, which wastes CPU and increases parallelism waits.' 'Raise it to 50 as a starting point and adjust based on your workload.'
+        $assess['cost threshold for parallelism'] = 'Valeur par défaut (5) trop basse'
+        Add-Finding 'Medium' 'Le seuil de coût du parallélisme est à sa valeur par défaut (5)' "Même des requêtes légères s'exécutent en parallèle, ce qui gaspille du CPU et augmente les attentes de parallélisme." "Le porter à 50 comme point de départ, puis ajuster selon la charge."
     } elseif ($ctfp -lt 25) {
-        $assess['cost threshold for parallelism'] = 'Low'
+        $assess['cost threshold for parallelism'] = 'Bas'
     } else {
         $assess['cost threshold for parallelism'] = 'OK'
     }
 
     if ([long]$cfg['optimize for ad hoc workloads'].value_in_use -eq 0) {
-        $assess['optimize for ad hoc workloads'] = 'Off - usually worth enabling'
-        Add-Finding 'Low' 'Optimize for ad hoc workloads is off' 'Single-use query plans are fully cached and can waste plan cache memory.' 'Enable it; it is safe for almost all workloads.'
+        $assess['optimize for ad hoc workloads'] = 'Désactivé - à activer en général'
+        Add-Finding 'Low' "L'option optimize for ad hoc workloads est désactivée" "Les plans de requêtes à usage unique sont mis en cache en entier et gaspillent la mémoire du cache de plans." "L'activer ; c'est sans risque pour la quasi-totalité des charges."
     } else { $assess['optimize for ad hoc workloads'] = 'OK' }
 
     if ([long]$cfg['priority boost'].value_in_use -eq 1) {
-        $assess['priority boost'] = 'ON - not supported'
-        Add-Finding 'High' 'Priority boost is enabled' 'This deprecated setting can starve the operating system and cluster services.' 'Disable it and restart SQL Server.'
+        $assess['priority boost'] = 'ACTIVÉ - non supporté'
+        Add-Finding 'High' "L'option priority boost est activée" "Ce paramètre obsolète peut affamer le système d'exploitation et les services de cluster." "La désactiver et redémarrer SQL Server."
     }
     if ([long]$cfg['lightweight pooling'].value_in_use -eq 1) {
-        $assess['lightweight pooling'] = 'ON - not recommended'
-        Add-Finding 'Medium' 'Lightweight pooling (fiber mode) is enabled' 'Fiber mode is rarely beneficial and breaks several features.' 'Disable it unless a specific test proved a benefit.'
+        $assess['lightweight pooling'] = 'ACTIVÉ - déconseillé'
+        Add-Finding 'Medium' "Le mode fibre (lightweight pooling) est activé" "Le mode fibre est rarement bénéfique et empêche plusieurs fonctionnalités de fonctionner." "Le désactiver, sauf si un test précis a démontré un gain."
     }
     if ([long]$cfg['max worker threads'].value_in_use -ne 0) {
-        $assess['max worker threads'] = 'Changed from default'
-        Add-Finding 'Low' 'Max worker threads has been changed from the default' 'Raising it usually hides blocking or parallelism problems rather than fixing them.' 'Reset to 0 (automatic) unless there is a documented reason.'
+        $assess['max worker threads'] = 'Modifié par rapport à la valeur par défaut'
+        Add-Finding 'Low' "Le paramètre max worker threads a été modifié" "L'augmenter masque généralement un problème de blocage ou de parallélisme au lieu de le résoudre." "Le remettre à 0 (automatique), sauf raison documentée."
     }
 
     $pending = @($rows | Where-Object { $_.value -ne $_.value_in_use } | ForEach-Object { $_.name })
     if ($pending.Count -gt 0) {
-        Add-Finding 'Low' 'Configuration changes are pending' ('Configured but not active: ' + (Join-Names $pending) + '.') 'Run RECONFIGURE or restart SQL Server during a maintenance window.'
+        Add-Finding 'Low' 'Des modifications de configuration sont en attente' ('Configurées mais pas encore actives : ' + (Join-Names $pending) + '.') "Exécuter RECONFIGURE ou redémarrer SQL Server pendant une fenêtre de maintenance."
     }
 
     $out = foreach ($r in ($rows | Sort-Object name)) {
         [pscustomobject]@{
-            'Setting' = $r.name
-            'Value in use' = $r.value_in_use
-            'Assessment' = $(if ($assess.ContainsKey($r.name)) { $assess[$r.name] } else { 'OK' })
+            'Paramètre' = $r.name
+            'Valeur active' = $r.value_in_use
+            'Évaluation' = $(if ($assess.ContainsKey($r.name)) { $assess[$r.name] } else { 'OK' })
         }
     }
-    Add-Table 'Key server settings' $out @(3, 1.4, 3)
+    Add-Table 'Principaux paramètres du serveur' $out @(3, 1.4, 3)
 }
 
 function Get-PerfCounters {
@@ -451,7 +458,7 @@ function Test-Waits {
     $w = @($all | Where-Object { -not (Test-BenignWait $_.wait_type) } | Sort-Object -Property { [double]$_.wait_time_ms } -Descending)
     $total = 0.0; $signal = 0.0
     foreach ($r in $w) { $total += [double]$r.wait_time_ms; $signal += [double]$r.signal_wait_time_ms }
-    if ($total -le 0) { Add-Note 'No significant waits recorded since startup.'; return }
+    if ($total -le 0) { Add-Note "Aucune attente significative enregistrée depuis le démarrage."; return }
 
     $out = New-Object System.Collections.ArrayList
     $i = 0
@@ -461,29 +468,29 @@ function Test-Waits {
         $avg = [double]$r.wait_time_ms / [math]::Max(1, [double]$r.waiting_tasks_count)
         $info = Get-WaitInfo $r.wait_type
         [void]$out.Add([pscustomobject]@{
-            'Wait type' = $r.wait_type
-            '% of waits' = [math]::Round($pct, 1)
-            'Avg wait (ms)' = [math]::Round($avg, 1)
-            'What it usually means' = $info.M
+            "Type d'attente" = $r.wait_type
+            '% des attentes' = [math]::Round($pct, 1)
+            'Attente moy. (ms)' = [math]::Round($avg, 1)
+            'Signification habituelle' = $info.M
         })
         if ($i -lt 5 -and $pct -ge 10) {
             $sev = 'Low'
             if ($pct -ge 25) { $sev = 'Medium' }
             if ($r.wait_type -like 'RESOURCE_SEMAPHORE*' -or $pct -ge 50) { $sev = 'High' }
             if ($r.wait_type -eq 'ASYNC_NETWORK_IO' -or $r.wait_type -like 'BACKUP*') { $sev = 'Low' }
-            Add-Finding $sev ($r.wait_type + ' is ' + (Format-N1 $pct) + '% of all waits') ($info.M + ' Average wait ' + (Format-N1 $avg) + ' ms.') $info.F
+            Add-Finding $sev ($r.wait_type + ' représente ' + (Format-N1 $pct) + ' % des attentes') ($info.M + ' Attente moyenne : ' + (Format-N1 $avg) + ' ms.') $info.F
         }
         $i++
     }
-    Add-Table ('Top waits since ' + (Format-Value $script:Ctx.StartTime)) $out @(2.2, 1, 1, 5)
+    Add-Table ('Principales attentes depuis le ' + (Format-Date $script:Ctx.StartTime)) $out @(2.2, 1, 1, 5)
 
     $tp = @($all | Where-Object { $_.wait_type -eq 'THREADPOOL' })
     if ($tp.Count -gt 0 -and [double]$tp[0].wait_time_ms -ge 10000) {
-        Add-Finding 'High' 'Worker thread starvation has occurred (THREADPOOL waits)' ('Requests waited ' + (Format-N0 ([double]$tp[0].wait_time_ms / 1000)) + ' seconds in total for a worker thread. Users would have seen timeouts or a frozen server.') 'Investigate blocking and parallelism at the times it happens; do not simply raise max worker threads.'
+        Add-Finding 'High' "Pénurie de threads de travail constatée (attentes THREADPOOL)" ('Des requêtes ont attendu ' + (Format-N0 ([double]$tp[0].wait_time_ms / 1000)) + " secondes au total qu'un thread se libère. Les utilisateurs ont probablement subi des délais d'attente ou un serveur figé.") "Analyser les blocages et le parallélisme aux moments concernés ; ne pas se contenter d'augmenter max worker threads."
     }
     $sigPct = 100.0 * $signal / $total
     if ($sigPct -ge 20) {
-        Add-Finding 'Medium' ('Signal waits are ' + (Format-N1 $sigPct) + '% of wait time') 'Tasks spend a large share of time waiting for a CPU after their resource became available, which points to CPU pressure.' 'Tune the top CPU queries and review parallelism settings; confirm CPU capacity.'
+        Add-Finding 'Medium' ('Les attentes de signal représentent ' + (Format-N1 $sigPct) + " % du temps d'attente") "Les tâches passent une grande partie de leur temps à attendre un processeur une fois leur ressource disponible : c'est un signe de pression CPU." "Optimiser les requêtes les plus consommatrices de CPU et revoir les paramètres de parallélisme ; vérifier la capacité CPU."
     }
 }
 
@@ -504,7 +511,7 @@ FROM (SELECT x.[timestamp],
               AND record LIKE N'%<SystemHealth>%') AS x) AS y
 ORDER BY y.record_id DESC;
 '@)
-    if ($rb.Count -eq 0) { Add-Note 'No CPU history available.'; return }
+    if ($rb.Count -eq 0) { Add-Note "Aucun historique CPU disponible."; return }
     $sum = 0.0; $max = 0.0; $other = 0.0; $busy = 0
     foreach ($r in $rb) {
         $v = [double]$r.sql_cpu
@@ -515,23 +522,22 @@ ORDER BY y.record_id DESC;
     $n = $rb.Count
     $avg = $sum / $n; $avgOther = $other / $n; $busyPct = 100.0 * $busy / $n
     $oldest = ($rb | Sort-Object -Property { [datetime]$_.event_time } | Select-Object -First 1).event_time
-    $script:Ctx.CpuAvg = $avg
 
-    Add-Table 'CPU usage (one sample per minute)' @(
-        [pscustomobject]@{ Metric = 'Period covered';                     Value = ('Since ' + (Format-Value $oldest) + ' (' + $n + ' minutes)') },
-        [pscustomobject]@{ Metric = 'Average SQL Server CPU %';           Value = [math]::Round($avg, 1) },
-        [pscustomobject]@{ Metric = 'Peak SQL Server CPU %';              Value = [math]::Round($max, 1) },
-        [pscustomobject]@{ Metric = 'Minutes with SQL CPU at 80% or more'; Value = ([string]$busy + ' (' + (Format-N1 $busyPct) + '%)') },
-        [pscustomobject]@{ Metric = 'Average CPU % used by other processes'; Value = [math]::Round($avgOther, 1) }
+    Add-Table 'Utilisation du processeur (une mesure par minute)' @(
+        [pscustomobject]@{ 'Mesure' = 'Période couverte';                          'Valeur' = ('Depuis le ' + (Format-Date $oldest) + ' (' + $n + ' minutes)') },
+        [pscustomobject]@{ 'Mesure' = 'CPU moyen de SQL Server (%)';               'Valeur' = [math]::Round($avg, 1) },
+        [pscustomobject]@{ 'Mesure' = 'Pic de CPU de SQL Server (%)';              'Valeur' = [math]::Round($max, 1) },
+        [pscustomobject]@{ 'Mesure' = 'Minutes avec un CPU SQL à 80 % ou plus';    'Valeur' = ([string]$busy + ' (' + (Format-N1 $busyPct) + ' %)') },
+        [pscustomobject]@{ 'Mesure' = 'CPU moyen des autres processus (%)';        'Valeur' = [math]::Round($avgOther, 1) }
     ) @(2, 2)
 
     if ($avg -ge 80) {
-        Add-Finding 'High' ('SQL Server CPU averages ' + (Format-N1 $avg) + '%') 'The server is CPU-bound; queries queue for CPU and response times suffer.' 'Tune the top CPU queries (see Top queries), check parallelism settings, then consider more CPU.'
+        Add-Finding 'High' ('Le CPU de SQL Server est en moyenne à ' + (Format-N1 $avg) + ' %') "Le serveur est limité par le processeur : les requêtes font la queue pour obtenir du CPU et les temps de réponse en pâtissent." "Optimiser les requêtes les plus consommatrices (voir Requêtes les plus coûteuses), vérifier les paramètres de parallélisme, puis envisager plus de CPU."
     } elseif ($avg -ge 60 -or $busyPct -ge 20) {
-        Add-Finding 'Medium' ('SQL Server CPU is high (average ' + (Format-N1 $avg) + '%, peak ' + (Format-N1 $max) + '%)') ('CPU was at 80% or more for ' + (Format-N1 $busyPct) + '% of the period.') 'Tune the top CPU queries (see Top queries) before adding hardware.'
+        Add-Finding 'Medium' ('Le CPU de SQL Server est élevé (moyenne ' + (Format-N1 $avg) + ' %, pic ' + (Format-N1 $max) + ' %)') ('Le CPU a été à 80 % ou plus pendant ' + (Format-N1 $busyPct) + ' % de la période.') "Optimiser les requêtes les plus consommatrices (voir Requêtes les plus coûteuses) avant d'ajouter du matériel."
     }
     if ($avgOther -ge 20) {
-        Add-Finding 'Medium' ('Other processes use ' + (Format-N1 $avgOther) + '% CPU on this server') 'Something other than SQL Server (antivirus, other services, another instance) competes for CPU.' 'Identify the process on the server; move it off or exclude SQL files from antivirus scanning.'
+        Add-Finding 'Medium' ("D'autres processus utilisent " + (Format-N1 $avgOther) + ' % du CPU de ce serveur') "Un autre programme que SQL Server (antivirus, autres services, autre instance) lui dispute le processeur." "Identifier le processus sur le serveur ; le déplacer, ou exclure les fichiers SQL Server de l'analyse antivirus."
     }
 
     $c = $script:Ctx.Counters
@@ -539,7 +545,7 @@ ORDER BY y.record_id DESC;
     if ($c.ContainsKey('Batch Requests/sec') -and $c.ContainsKey('SQL Compilations/sec')) {
         $bps = $c['Batch Requests/sec'] / $up; $cps = $c['SQL Compilations/sec'] / $up
         if ($bps -ge 10 -and $cps / $bps -ge 0.15) {
-            Add-Finding 'Medium' ('Compilations are ' + (Format-N0 (100 * $cps / $bps)) + '% of batch requests') 'Most queries are compiled instead of reusing cached plans, which costs CPU. Typical cause: non-parameterized ad hoc SQL.' 'Parameterize queries in the application; enable optimize for ad hoc workloads; consider forced parameterization for the worst database.'
+            Add-Finding 'Medium' ('Les compilations représentent ' + (Format-N0 (100 * $cps / $bps)) + ' % des requêtes') "La plupart des requêtes sont compilées au lieu de réutiliser un plan en cache, ce qui coûte du CPU. Cause habituelle : du SQL dynamique non paramétré." "Paramétrer les requêtes dans l'application ; activer optimize for ad hoc workloads ; envisager le paramétrage forcé (forced parameterization) sur la base la plus concernée."
         }
     }
 }
@@ -556,27 +562,27 @@ function Test-Memory {
     $availMB = [double]$sm.available_physical_memory_kb / 1024
     $totalOsMB = [double]$sm.total_physical_memory_kb / 1024
     $availPct = 0; if ($totalOsMB -gt 0) { $availPct = 100.0 * $availMB / $totalOsMB }
-    # PLE threshold scaled to memory size: 300 s per 4 GB of SQL memory.
+    # Seuil de page life expectancy proportionnel à la mémoire : 300 s par tranche de 4 Go.
     $pleThreshold = [math]::Max(300, [math]::Round(($totalKB / 1024 / 1024) / 4 * 300))
 
-    Add-Table 'Memory' @(
-        [pscustomobject]@{ Metric = 'OS memory available';         Value = ((Format-N0 $availMB) + ' MB of ' + (Format-N0 $totalOsMB) + ' MB (' + (Format-N1 $availPct) + '%)') },
-        [pscustomobject]@{ Metric = 'OS memory state';             Value = $sm.system_memory_state_desc },
-        [pscustomobject]@{ Metric = 'SQL Server memory in use';    Value = ((Format-N0 ([double]$pm.physical_memory_in_use_kb / 1024)) + ' MB') },
-        [pscustomobject]@{ Metric = 'SQL Server target / total';   Value = ((Format-N0 ($targetKB / 1024)) + ' MB / ' + (Format-N0 ($totalKB / 1024)) + ' MB') },
-        [pscustomobject]@{ Metric = 'Locked pages in memory';      Value = $(if ([double]$pm.locked_page_allocations_kb -gt 0) { 'In use' } else { 'Not in use' }) },
-        [pscustomobject]@{ Metric = 'Page life expectancy (now)';  Value = ((Format-N0 $ple) + ' s (guideline for this size: ' + (Format-N0 $pleThreshold) + ' s)') },
-        [pscustomobject]@{ Metric = 'Memory grants pending (now)'; Value = $pending }
+    Add-Table 'Mémoire' @(
+        [pscustomobject]@{ 'Mesure' = 'Mémoire disponible pour le système';          'Valeur' = ((Format-N0 $availMB) + ' Mo sur ' + (Format-N0 $totalOsMB) + ' Mo (' + (Format-N1 $availPct) + ' %)') },
+        [pscustomobject]@{ 'Mesure' = 'État mémoire du système';                     'Valeur' = $sm.system_memory_state_desc },
+        [pscustomobject]@{ 'Mesure' = 'Mémoire utilisée par SQL Server';             'Valeur' = ((Format-N0 ([double]$pm.physical_memory_in_use_kb / 1024)) + ' Mo') },
+        [pscustomobject]@{ 'Mesure' = 'Mémoire cible / totale de SQL Server';        'Valeur' = ((Format-N0 ($targetKB / 1024)) + ' Mo / ' + (Format-N0 ($totalKB / 1024)) + ' Mo') },
+        [pscustomobject]@{ 'Mesure' = 'Verrouillage des pages en mémoire';           'Valeur' = $(if ([double]$pm.locked_page_allocations_kb -gt 0) { 'Utilisé' } else { 'Non utilisé' }) },
+        [pscustomobject]@{ 'Mesure' = 'Page life expectancy (instantané)';           'Valeur' = ((Format-N0 $ple) + ' s (repère pour cette taille : ' + (Format-N0 $pleThreshold) + ' s)') },
+        [pscustomobject]@{ 'Mesure' = 'Allocations mémoire en attente (instantané)'; 'Valeur' = $pending }
     ) @(2, 3)
 
     if ($pm.process_physical_memory_low -or $sm.system_memory_state_desc -like '*low*' -or ($availMB -lt 512 -and $totalOsMB -gt 0)) {
-        Add-Finding 'High' 'The server is low on memory' ('Only ' + (Format-N0 $availMB) + ' MB is available to the OS (state: ' + $sm.system_memory_state_desc + ').') 'Check max server memory and other processes on the server; the OS may be paging.'
+        Add-Finding 'High' 'Le serveur manque de mémoire' ('Seulement ' + (Format-N0 $availMB) + ' Mo sont disponibles pour le système (état : ' + $sm.system_memory_state_desc + ').') "Vérifier max server memory et les autres processus du serveur ; le système est peut-être en train de paginer."
     }
     if ($null -ne $ple -and $ple -lt $pleThreshold -and [double]$script:Ctx.UptimeDays -ge 0.05) {
-        Add-Finding 'Medium' ('Page life expectancy is low (' + (Format-N0 $ple) + ' s)') ('Data pages stay in memory for a short time (guideline for this memory size: ' + (Format-N0 $pleThreshold) + ' s), so SQL Server re-reads data from disk. This is a snapshot; check it at several times of day.') 'Reduce large scans (top reads queries, missing indexes) or add memory.'
+        Add-Finding 'Medium' ('La page life expectancy est basse (' + (Format-N0 $ple) + ' s)') ('Les pages de données restent peu de temps en mémoire (repère pour cette taille de mémoire : ' + (Format-N0 $pleThreshold) + " s) : SQL Server relit souvent les données sur disque. C'est une mesure instantanée, à vérifier à plusieurs moments de la journée.") "Réduire les gros parcours de tables (requêtes à fortes lectures, index manquants) ou ajouter de la mémoire."
     }
     if ($pending -gt 0) {
-        Add-Finding 'Medium' ([string]$pending + ' queries are waiting for a memory grant right now') 'Queries cannot start until memory is available for their sorts and hash joins.' 'Find queries with large memory grants and tune them; check max server memory.'
+        Add-Finding 'Medium' ([string]$pending + " requête(s) en attente d'allocation mémoire au moment de l'audit") "Ces requêtes ne peuvent pas démarrer tant que la mémoire nécessaire à leurs tris et jointures n'est pas disponible." "Identifier les requêtes qui demandent beaucoup de mémoire et les optimiser ; vérifier max server memory."
     }
 }
 
@@ -600,28 +606,28 @@ ORDER BY vfs.io_stall DESC
 
     $table = foreach ($f in ($files | Select-Object -First $Top)) {
         [pscustomobject]@{
-            'Database' = $f.Db; 'File' = $f.File; 'Type' = $f.Type
-            'Reads' = [long]$f.Reads
-            'Avg read (ms)' = $(if ($null -ne $f.ReadMs) { [math]::Round($f.ReadMs, 1) } else { $null })
-            'Writes' = [long]$f.Writes
-            'Avg write (ms)' = $(if ($null -ne $f.WriteMs) { [math]::Round($f.WriteMs, 1) } else { $null })
+            'Base' = $f.Db; 'Fichier' = $f.File; 'Type' = $f.Type
+            'Lectures' = [long]$f.Reads
+            'Lecture moy. (ms)' = $(if ($null -ne $f.ReadMs) { [math]::Round($f.ReadMs, 1) } else { $null })
+            'Écritures' = [long]$f.Writes
+            'Écriture moy. (ms)' = $(if ($null -ne $f.WriteMs) { [math]::Round($f.WriteMs, 1) } else { $null })
         }
     }
-    Add-Table 'Files with the most I/O wait time (since startup)' $table @(2, 2, 1, 1.3, 1.2, 1.3, 1.2) 'Guidelines: data file reads under 20 ms, log file writes under 5 ms (under 2 ms on SSD).'
+    Add-Table "Fichiers cumulant le plus d'attente d'E/S (depuis le démarrage)" $table @(2, 2, 1, 1.3, 1.2, 1.3, 1.2) "Repères : lectures des fichiers de données sous 20 ms, écritures du journal sous 5 ms (sous 2 ms sur SSD)."
 
     $slowData = @($files | Where-Object { $_.Type -eq 'ROWS' -and $_.Reads -ge 1000 -and $_.ReadMs -ge 20 } | Sort-Object ReadMs -Descending)
     if ($slowData.Count -gt 0) {
         $worst = $slowData[0]
         $sev = 'Medium'; if ($worst.ReadMs -ge 50) { $sev = 'High' }
         $list = @($slowData | ForEach-Object { $_.Db + '/' + $_.File + ' ' + (Format-N0 $_.ReadMs) + ' ms' })
-        Add-Finding $sev ('Slow data file reads on ' + $slowData.Count + ' file(s)') ('Average read latency: ' + (Join-Names $list 5) + '.') 'Check the storage (SAN/VM datastore latency, disk queue). Reducing scans through indexing also lowers read volume.'
+        Add-Finding $sev ('Lectures lentes sur ' + $slowData.Count + ' fichier(s) de données') ('Latence moyenne de lecture : ' + (Join-Names $list 5) + '.') "Vérifier le stockage (latence du SAN ou du datastore de la VM, file d'attente disque). Réduire les parcours de tables grâce à l'indexation diminue aussi le volume lu."
     }
     $slowLog = @($files | Where-Object { $_.Type -eq 'LOG' -and $_.Writes -ge 1000 -and $_.WriteMs -ge 5 } | Sort-Object WriteMs -Descending)
     if ($slowLog.Count -gt 0) {
         $worst = $slowLog[0]
         $sev = 'Low'; if ($worst.WriteMs -ge 10) { $sev = 'Medium' }; if ($worst.WriteMs -ge 20) { $sev = 'High' }
         $list = @($slowLog | ForEach-Object { $_.Db + ' ' + (Format-N1 $_.WriteMs) + ' ms' })
-        Add-Finding $sev ('Slow transaction log writes on ' + $slowLog.Count + ' database(s)') ('Every commit waits for the log write. Average write latency: ' + (Join-Names $list 5) + '.') 'Move busy log files to low-latency storage and keep them separate from data files.'
+        Add-Finding $sev ('Écritures lentes du journal de transactions sur ' + $slowLog.Count + ' base(s)') ("Chaque validation de transaction attend l'écriture du journal. Latence moyenne d'écriture : " + (Join-Names $list 5) + '.') "Placer les journaux les plus sollicités sur un stockage à faible latence, séparé des fichiers de données."
     }
 }
 
@@ -633,21 +639,21 @@ function Test-TempDb {
 
     $table = foreach ($f in $files) {
         [pscustomobject]@{
-            'File' = $f.name; 'Type' = $f.type_desc; 'Size (MB)' = $f.size_mb
-            'Growth' = $(if ($f.is_percent_growth) { [string]$f.growth + ' %' } else { (Format-N0 ([double]$f.growth / 128)) + ' MB' })
-            'Path' = $f.physical_name
+            'Fichier' = $f.name; 'Type' = $f.type_desc; 'Taille (Mo)' = $f.size_mb
+            'Croissance' = $(if ($f.is_percent_growth) { [string]$f.growth + ' %' } else { (Format-N0 ([double]$f.growth / 128)) + ' Mo' })
+            'Chemin' = $f.physical_name
         }
     }
-    Add-Table 'TempDB files' $table @(1.5, 1, 1, 1, 4)
+    Add-Table 'Fichiers de TempDB' $table @(1.5, 1, 1, 1, 4)
 
     if ($data.Count -lt $rec) {
-        Add-Finding 'Medium' ('TempDB has ' + $data.Count + ' data file(s) for ' + $cpu + ' CPUs') 'Too few files cause allocation contention (PAGELATCH waits) when many sessions use temporary tables.' ('Use ' + $rec + ' equally sized data files (one per CPU up to 8).')
+        Add-Finding 'Medium' ('TempDB a ' + $data.Count + ' fichier(s) de données pour ' + $cpu + ' processeurs') "Un nombre insuffisant de fichiers provoque de la contention sur les pages d'allocation (attentes PAGELATCH) quand de nombreuses sessions utilisent des tables temporaires." ('Utiliser ' + $rec + ' fichiers de données de même taille (un par processeur, jusqu''à 8).')
     }
     if (@($data | ForEach-Object { [double]$_.size_mb } | Select-Object -Unique).Count -gt 1) {
-        Add-Finding 'Low' 'TempDB data files have different sizes' 'SQL Server favours the largest file, which defeats the purpose of multiple files.' 'Make all tempdb data files the same size and growth.'
+        Add-Finding 'Low' 'Les fichiers de données de TempDB ont des tailles différentes' "SQL Server privilégie le plus gros fichier, ce qui annule l'intérêt d'avoir plusieurs fichiers." "Donner la même taille et la même croissance à tous les fichiers de données de tempdb."
     }
     if (@($files | Where-Object { $_.is_percent_growth }).Count -gt 0) {
-        Add-Finding 'Low' 'TempDB uses percentage autogrowth' 'Growth becomes large and unpredictable as files grow.' 'Use a fixed growth increment (for example 256-1024 MB).'
+        Add-Finding 'Low' 'TempDB utilise une croissance automatique en pourcentage' "Les croissances deviennent de plus en plus grosses et imprévisibles à mesure que les fichiers grossissent." "Utiliser une croissance fixe (par exemple de 256 à 1 024 Mo)."
     }
 }
 
@@ -659,18 +665,18 @@ FROM sys.databases AS d
 WHERE d.database_id > 4 AND d.state_desc = 'ONLINE' AND d.source_database_id IS NULL
 ORDER BY d.name
 '@)
-    if ($dbs.Count -eq 0) { Add-Note 'No online user databases.'; return }
+    if ($dbs.Count -eq 0) { Add-Note "Aucune base utilisateur en ligne."; return }
     $issues = @{}
     foreach ($d in $dbs) { $issues[$d.name] = New-Object System.Collections.ArrayList }
     $shrink = @(); $close = @(); $verify = @(); $stats = @(); $compat = @()
     $maxCompat = 0; if ([int]$script:Ctx.Major -ge 11) { $maxCompat = [int]$script:Ctx.Major * 10 }
 
     foreach ($d in $dbs) {
-        if ($d.is_auto_shrink_on) { $shrink += $d.name; [void]$issues[$d.name].Add('Auto-shrink on') }
-        if ($d.is_auto_close_on) { $close += $d.name; [void]$issues[$d.name].Add('Auto-close on') }
+        if ($d.is_auto_shrink_on) { $shrink += $d.name; [void]$issues[$d.name].Add('Auto-shrink activé') }
+        if ($d.is_auto_close_on) { $close += $d.name; [void]$issues[$d.name].Add('Auto-close activé') }
         if ($d.page_verify_option_desc -ne 'CHECKSUM') { $verify += $d.name; [void]$issues[$d.name].Add('Page verify ' + $d.page_verify_option_desc) }
-        if (-not $d.is_auto_create_stats_on -or -not $d.is_auto_update_stats_on) { $stats += $d.name; [void]$issues[$d.name].Add('Auto statistics off') }
-        if ($maxCompat -gt 0 -and [int]$d.compatibility_level -lt ($maxCompat - 20)) { $compat += ($d.name + ' (' + $d.compatibility_level + ')'); [void]$issues[$d.name].Add('Old compatibility level ' + $d.compatibility_level) }
+        if (-not $d.is_auto_create_stats_on -or -not $d.is_auto_update_stats_on) { $stats += $d.name; [void]$issues[$d.name].Add('Statistiques automatiques désactivées') }
+        if ($maxCompat -gt 0 -and [int]$d.compatibility_level -lt ($maxCompat - 20)) { $compat += ($d.name + ' (' + $d.compatibility_level + ')'); [void]$issues[$d.name].Add('Niveau de compatibilité ancien : ' + $d.compatibility_level) }
     }
 
     $files = @(Invoke-Q 'SELECT DB_NAME(database_id) AS db, name, growth, is_percent_growth, CAST(size / 128.0 AS decimal(18,1)) AS size_mb FROM sys.master_files WHERE database_id > 4')
@@ -678,9 +684,9 @@ ORDER BY d.name
     foreach ($f in $files) {
         if (-not $f.db -or -not $issues.ContainsKey($f.db)) { continue }
         if ($f.is_percent_growth -and [int]$f.growth -gt 0) {
-            $pct += ($f.db + '/' + $f.name); [void]$issues[$f.db].Add('Percent growth: ' + $f.name)
+            $pct += ($f.db + '/' + $f.name); [void]$issues[$f.db].Add('Croissance en pourcentage : ' + $f.name)
         } elseif (-not $f.is_percent_growth -and [int]$f.growth -gt 0 -and [int]$f.growth -le 128) {
-            $tiny += ($f.db + '/' + $f.name); [void]$issues[$f.db].Add('Growth 1 MB or less: ' + $f.name)
+            $tiny += ($f.db + '/' + $f.name); [void]$issues[$f.db].Add('Croissance de 1 Mo ou moins : ' + $f.name)
         }
     }
 
@@ -695,10 +701,10 @@ WHERE d.database_id > 4 AND d.state_desc = 'ONLINE' AND d.recovery_model_desc <>
         foreach ($b in $bk) {
             if ($null -eq $b.last_log -or ([datetime]$b.last_log) -lt $script:Ctx.ServerTime.AddHours(-24)) {
                 $noLogBackup += $b.name
-                if ($issues.ContainsKey($b.name)) { [void]$issues[$b.name].Add('No log backup in 24 h') }
+                if ($issues.ContainsKey($b.name)) { [void]$issues[$b.name].Add('Pas de sauvegarde du journal depuis 24 h') }
             }
         }
-    } catch { Add-Note ('Backup history not checked: ' + (Get-ShortError $_)) }
+    } catch { Add-Note ("Historique des sauvegardes non vérifié : " + (Get-ShortError $_)) }
 
     $manyVlf = @(); $worstVlf = 0
     try {
@@ -706,34 +712,34 @@ WHERE d.database_id > 4 AND d.state_desc = 'ONLINE' AND d.recovery_model_desc <>
         foreach ($v in $vl) {
             $manyVlf += ($v.name + ' (' + $v.vlfs + ')')
             if ([int]$v.vlfs -gt $worstVlf) { $worstVlf = [int]$v.vlfs }
-            if ($issues.ContainsKey($v.name)) { [void]$issues[$v.name].Add('' + $v.vlfs + ' VLFs') }
+            if ($issues.ContainsKey($v.name)) { [void]$issues[$v.name].Add('' + $v.vlfs + ' VLF') }
         }
     } catch { }
 
     $table = foreach ($d in $dbs) {
         if ($issues[$d.name].Count -gt 0) {
             [pscustomobject]@{
-                'Database' = $d.name; 'Recovery' = $d.recovery_model_desc; 'Compat' = $d.compatibility_level
-                'Issues found' = ($issues[$d.name] -join '; ')
+                'Base' = $d.name; 'Récupération' = $d.recovery_model_desc; 'Compat.' = $d.compatibility_level
+                'Problèmes détectés' = ($issues[$d.name] -join ' ; ')
             }
         }
     }
     $table = @($table)
     $clean = $dbs.Count - $table.Count
-    Add-Table 'Databases with configuration issues' $table @(2, 1.3, 0.8, 5) ([string]$clean + ' of ' + $dbs.Count + ' user databases have no issues and are not listed.')
+    Add-Table 'Bases présentant des problèmes de configuration' $table @(2, 1.3, 0.8, 5) ([string]$clean + ' base(s) utilisateur sur ' + $dbs.Count + ' ne présentent aucun problème et ne sont pas listées.')
 
-    if ($shrink.Count) { Add-Finding 'High' ('Auto-shrink is on for ' + $shrink.Count + ' database(s)') ((Join-Names $shrink) + '. Shrink/grow cycles fragment indexes and burn CPU and I/O.') 'Turn AUTO_SHRINK off.' }
-    if ($close.Count) { Add-Finding 'Medium' ('Auto-close is on for ' + $close.Count + ' database(s)') ((Join-Names $close) + '. The database is closed and reopened repeatedly, flushing its cache.') 'Turn AUTO_CLOSE off.' }
-    if ($stats.Count) { Add-Finding 'Medium' ('Automatic statistics are off for ' + $stats.Count + ' database(s)') ((Join-Names $stats) + '. Outdated statistics lead to bad query plans.') 'Turn AUTO_CREATE_STATISTICS and AUTO_UPDATE_STATISTICS on, unless a vendor requires otherwise.' }
-    if ($verify.Count) { Add-Finding 'Medium' ('Page verify is not CHECKSUM on ' + $verify.Count + ' database(s)') ((Join-Names $verify) + '. Corruption may go undetected.') 'Set PAGE_VERIFY CHECKSUM.' }
-    if ($pct.Count) { Add-Finding 'Low' ('Percentage autogrowth on ' + $pct.Count + ' file(s)') ((Join-Names $pct) + '. Growth events get larger and slower as files grow.') 'Use fixed growth increments (e.g. 256-1024 MB for data, 256-512 MB for logs).' }
-    if ($tiny.Count) { Add-Finding 'Medium' ('Autogrowth of 1 MB or less on ' + $tiny.Count + ' file(s)') ((Join-Names $tiny) + '. Files grow in thousands of tiny steps, each one stalling activity.') 'Pre-size files and set fixed growth increments of at least 64 MB.' }
-    if ($noLogBackup.Count) { Add-Finding 'Medium' ([string]$noLogBackup.Count + ' database(s) in FULL recovery without a log backup in 24 hours') ((Join-Names $noLogBackup) + '. The log keeps growing, which slows backups, restores and startup. (If log backups run on another AG replica, ignore this.)') 'Schedule regular log backups, or switch to SIMPLE recovery if point-in-time restore is not needed.' }
+    if ($shrink.Count) { Add-Finding 'High' ('Auto-shrink est activé sur ' + $shrink.Count + ' base(s)') ((Join-Names $shrink) + '. Les cycles de réduction et de croissance fragmentent les index et consomment CPU et E/S.') "Désactiver AUTO_SHRINK." }
+    if ($close.Count) { Add-Finding 'Medium' ('Auto-close est activé sur ' + $close.Count + ' base(s)') ((Join-Names $close) + '. La base est fermée et rouverte en permanence et perd son cache.') "Désactiver AUTO_CLOSE." }
+    if ($stats.Count) { Add-Finding 'Medium' ('Les statistiques automatiques sont désactivées sur ' + $stats.Count + ' base(s)') ((Join-Names $stats) + ". Des statistiques obsolètes produisent de mauvais plans d'exécution.") "Activer AUTO_CREATE_STATISTICS et AUTO_UPDATE_STATISTICS, sauf exigence contraire de l'éditeur." }
+    if ($verify.Count) { Add-Finding 'Medium' ("PAGE_VERIFY n'est pas à CHECKSUM sur " + $verify.Count + ' base(s)') ((Join-Names $verify) + '. Une corruption peut passer inaperçue.') "Passer PAGE_VERIFY à CHECKSUM." }
+    if ($pct.Count) { Add-Finding 'Low' ('Croissance automatique en pourcentage sur ' + $pct.Count + ' fichier(s)') ((Join-Names $pct) + '. Les croissances deviennent de plus en plus grosses et lentes à mesure que les fichiers grossissent.') "Utiliser une croissance fixe (par exemple 256 à 1 024 Mo pour les données, 256 à 512 Mo pour les journaux)." }
+    if ($tiny.Count) { Add-Finding 'Medium' ('Croissance automatique de 1 Mo ou moins sur ' + $tiny.Count + ' fichier(s)') ((Join-Names $tiny) + ". Les fichiers grossissent par milliers de petits pas, chacun bloquant l'activité.") "Pré-dimensionner les fichiers et définir une croissance fixe d'au moins 64 Mo." }
+    if ($noLogBackup.Count) { Add-Finding 'Medium' ([string]$noLogBackup.Count + ' base(s) en récupération FULL sans sauvegarde du journal depuis 24 heures') ((Join-Names $noLogBackup) + ". Le journal grossit sans limite, ce qui ralentit les sauvegardes, les restaurations et le démarrage. (À ignorer si les sauvegardes du journal sont faites sur un autre réplica d'un groupe de disponibilité.)") "Planifier des sauvegardes régulières du journal, ou passer en récupération SIMPLE si la restauration à un instant précis n'est pas nécessaire." }
     if ($manyVlf.Count) {
         $sev = 'Low'; if ($worstVlf -gt 1000) { $sev = 'Medium' }
-        Add-Finding $sev ('High number of virtual log files in ' + $manyVlf.Count + ' database(s)') ((Join-Names $manyVlf) + '. Many VLFs slow down recovery, restores and log backups.') 'Shrink the log once during a quiet period and regrow it in large fixed steps.'
+        Add-Finding $sev ('Nombre élevé de fichiers journaux virtuels (VLF) dans ' + $manyVlf.Count + ' base(s)') ((Join-Names $manyVlf) + '. Un grand nombre de VLF ralentit la récupération, les restaurations et les sauvegardes du journal.') "Réduire le journal une fois pendant une période calme, puis le faire regrossir par grands paliers fixes."
     }
-    if ($compat.Count) { Add-Finding 'Low' ('Old compatibility level on ' + $compat.Count + ' database(s)') ((Join-Names $compat) + '. These databases do not benefit from newer optimizer features.') 'Test and raise the compatibility level (Query Store helps catch regressions).' }
+    if ($compat.Count) { Add-Finding 'Low' ('Niveau de compatibilité ancien sur ' + $compat.Count + ' base(s)') ((Join-Names $compat) + ". Ces bases ne profitent pas des améliorations récentes de l'optimiseur.") "Tester puis relever le niveau de compatibilité (le Query Store aide à repérer les régressions)." }
 }
 
 function Test-TopQueries {
@@ -765,27 +771,27 @@ ORDER BY q.cpu_us DESC;
     $table = foreach ($r in $rows) {
         $ex = [math]::Max(1, [double]$r.execs)
         [pscustomobject]@{
-            'Database' = $r.db
-            'Executions' = [long]$r.execs
-            'Total CPU (s)' = [math]::Round([double]$r.cpu_us / 1000000, 1)
-            'Avg CPU (ms)' = [math]::Round([double]$r.cpu_us / 1000 / $ex, 1)
-            'Avg reads' = [long]([double]$r.reads / $ex)
-            'Avg duration (ms)' = [math]::Round([double]$r.dur_us / 1000 / $ex, 1)
-            '% of CPU' = [math]::Round(100 * [double]$r.cpu_us / $totCpu, 1)
-            'Query text' = (Format-QueryText $r.query_text)
+            'Base' = $r.db
+            'Exécutions' = [long]$r.execs
+            'CPU total (s)' = [math]::Round([double]$r.cpu_us / 1000000, 1)
+            'CPU moy. (ms)' = [math]::Round([double]$r.cpu_us / 1000 / $ex, 1)
+            'Lectures moy.' = [long]([double]$r.reads / $ex)
+            'Durée moy. (ms)' = [math]::Round([double]$r.dur_us / 1000 / $ex, 1)
+            '% du CPU' = [math]::Round(100 * [double]$r.cpu_us / $totCpu, 1)
+            'Texte de la requête' = (Format-QueryText $r.query_text)
         }
     }
     $table = @($table)
-    Add-Table 'Top statements by total CPU (similar statements grouped)' $table @(1.4, 1.1, 1, 1, 1.1, 1.1, 0.8, 6) 'Based on plans currently in cache. Queries recompiled or evicted from cache are not included.'
+    Add-Table 'Instructions les plus consommatrices de CPU (instructions similaires regroupées)' $table @(1.4, 1.1, 1, 1, 1.1, 1.1, 0.8, 6) "Basé sur les plans actuellement en cache. Les requêtes recompilées ou évincées du cache ne sont pas incluses."
 
     if ($table.Count -gt 0) {
         $top1 = $table[0]
-        if ($top1.'% of CPU' -ge 25) {
-            Add-Finding 'Medium' ('One statement uses ' + (Format-N1 $top1.'% of CPU') + '% of all cached CPU') ('Database ' + $top1.Database + ', ' + (Format-N0 $top1.Executions) + ' executions, ' + (Format-N1 $top1.'Avg CPU (ms)') + ' ms CPU each. Tuning it would have a large effect.') 'Review its execution plan (look for scans, key lookups, implicit conversions) and indexing. It is the first row of the Top queries table.'
+        if ($top1.'% du CPU' -ge 25) {
+            Add-Finding 'Medium' ('Une seule instruction consomme ' + (Format-N1 $top1.'% du CPU') + ' % du CPU des requêtes en cache') ('Base ' + $top1.Base + ', ' + (Format-N0 $top1.'Exécutions') + ' exécutions, ' + (Format-N1 $top1.'CPU moy. (ms)') + " ms de CPU chacune. L'optimiser aurait un effet important.") "Examiner son plan d'exécution (parcours de tables, key lookups, conversions implicites) et son indexation. C'est la première ligne du tableau des requêtes les plus coûteuses."
         }
-        $top5 = 0.0; foreach ($t in ($table | Select-Object -First 5)) { $top5 += [double]$t.'% of CPU' }
-        if ($top5 -ge 60 -and $top1.'% of CPU' -lt 25) {
-            Add-Finding 'Info' ('The top 5 statements use ' + (Format-N0 $top5) + '% of cached CPU') 'The workload is concentrated: tuning a handful of queries would make a noticeable difference.' 'Start with the first rows of the Top queries table.'
+        $top5 = 0.0; foreach ($t in ($table | Select-Object -First 5)) { $top5 += [double]$t.'% du CPU' }
+        if ($top5 -ge 60 -and $top1.'% du CPU' -lt 25) {
+            Add-Finding 'Info' ('Les 5 premières instructions consomment ' + (Format-N0 $top5) + ' % du CPU des requêtes en cache') "La charge est concentrée : optimiser quelques requêtes ferait une différence visible." "Commencer par les premières lignes du tableau des requêtes les plus coûteuses."
         }
     }
 }
@@ -793,13 +799,13 @@ ORDER BY q.cpu_us DESC;
 function Test-MissingIndexes {
     $sql = @'
 SELECT TOP ({TOP})
-       DB_NAME(mid.database_id) AS [Database],
+       DB_NAME(mid.database_id) AS [Base],
        mid.[statement] AS [Table],
-       mid.equality_columns AS [Equality columns],
-       mid.inequality_columns AS [Inequality columns],
-       mid.included_columns AS [Included columns],
-       migs.user_seeks + migs.user_scans AS [Uses],
-       CAST(migs.avg_user_impact AS decimal(5,1)) AS [Est. gain %],
+       mid.equality_columns AS [Colonnes d'égalité],
+       mid.inequality_columns AS [Colonnes d'inégalité],
+       mid.included_columns AS [Colonnes incluses],
+       migs.user_seeks + migs.user_scans AS [Utilisations],
+       CAST(migs.avg_user_impact AS decimal(5,1)) AS [Gain estimé %],
        CAST(migs.avg_total_user_cost * migs.avg_user_impact * (migs.user_seeks + migs.user_scans) AS decimal(18,0)) AS [Score]
 FROM sys.dm_db_missing_index_group_stats AS migs
 JOIN sys.dm_db_missing_index_groups AS mig ON mig.index_group_handle = migs.group_handle
@@ -808,19 +814,19 @@ WHERE mid.database_id > 4
 ORDER BY [Score] DESC;
 '@
     $rows = @(Invoke-Q ($sql.Replace('{TOP}', [string]$Top)))
-    Add-Table 'Missing index suggestions (highest benefit first)' $rows @(1.3, 2.5, 2, 1.5, 2, 0.9, 0.9, 1.1) 'Suggestions come from the optimizer and are often overlapping or too wide. Review and combine them; never create them blindly.'
+    Add-Table 'Suggestions d''index manquants (plus fort bénéfice en premier)' $rows @(1.3, 2.5, 2, 1.5, 2, 1, 0.9, 1.1) "Ces suggestions viennent de l'optimiseur : elles se recoupent souvent et sont parfois trop larges. Les examiner et les regrouper ; ne jamais les créer telles quelles."
     $high = @($rows | Where-Object { [double]$_.Score -ge 100000 })
     if ($high.Count -gt 0) {
         $tables = @($high | ForEach-Object { $_.Table } | Select-Object -Unique)
-        Add-Finding 'Medium' ([string]$high.Count + ' high-value missing index suggestion(s)') ('The optimizer repeatedly wanted indexes on: ' + (Join-Names $tables 4) + '.') 'Review the Missing indexes table, check existing indexes on those tables, and add consolidated indexes after testing.'
+        Add-Finding 'Medium' ([string]$high.Count + " suggestion(s) d'index manquant à fort bénéfice") ("L'optimiseur a demandé à plusieurs reprises des index sur : " + (Join-Names $tables 4) + '.') "Examiner le tableau des index manquants, vérifier les index existants sur ces tables, puis ajouter des index regroupés après test."
     }
 }
 
 function Test-Blocking {
     $blocked = @(Invoke-Q @'
-SELECT r.session_id AS [Session], r.blocking_session_id AS [Blocked by], DB_NAME(r.database_id) AS [Database],
-       r.wait_type AS [Wait type], CAST(r.wait_time / 1000.0 AS decimal(18,1)) AS [Waiting (s)],
-       s.login_name AS [Login], LEFT(st.text, 300) AS [Statement]
+SELECT r.session_id AS [Session], r.blocking_session_id AS [Bloquée par], DB_NAME(r.database_id) AS [Base],
+       r.wait_type AS [Type d'attente], CAST(r.wait_time / 1000.0 AS decimal(18,1)) AS [Attente (s)],
+       s.login_name AS [Login], LEFT(st.text, 300) AS [Instruction]
 FROM sys.dm_exec_requests AS r
 JOIN sys.dm_exec_sessions AS s ON s.session_id = r.session_id
 OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) AS st
@@ -828,9 +834,9 @@ WHERE r.blocking_session_id <> 0
 ORDER BY r.wait_time DESC
 '@)
     $longTx = @(Invoke-Q @'
-SELECT TOP (10) st.session_id AS [Session], s.login_name AS [Login], s.program_name AS [Program],
-       s.status AS [Status], at.transaction_begin_time AS [Started],
-       DATEDIFF(MINUTE, at.transaction_begin_time, GETDATE()) AS [Open (min)]
+SELECT TOP (10) st.session_id AS [Session], s.login_name AS [Login], s.program_name AS [Programme],
+       s.status AS [Statut], at.transaction_begin_time AS [Début],
+       DATEDIFF(MINUTE, at.transaction_begin_time, GETDATE()) AS [Ouverte depuis (min)]
 FROM sys.dm_tran_session_transactions AS st
 JOIN sys.dm_tran_active_transactions AS at ON at.transaction_id = st.transaction_id
 JOIN sys.dm_exec_sessions AS s ON s.session_id = st.session_id
@@ -838,33 +844,33 @@ WHERE s.is_user_process = 1 AND st.session_id <> @@SPID
   AND at.transaction_begin_time < DATEADD(MINUTE, -10, GETDATE())
 ORDER BY at.transaction_begin_time
 '@)
-    foreach ($b in $blocked) { $b.Statement = Format-QueryText $b.Statement }
+    foreach ($b in $blocked) { $b.Instruction = Format-QueryText $b.Instruction }
     if ($blocked.Count -gt 0) {
-        Add-Table 'Requests blocked at the time of the audit' $blocked @(0.8, 0.8, 1.3, 1.3, 0.9, 1.5, 5)
-        Add-Finding 'Medium' ([string]$blocked.Count + ' request(s) were blocked during the audit') ('Longest wait: ' + (Format-N1 $blocked[0].'Waiting (s)') + ' s, blocked by session ' + $blocked[0].'Blocked by' + '.') 'Identify the head blocker and what it is doing; look for long transactions and missing indexes on the tables involved.'
+        Add-Table "Requêtes bloquées au moment de l'audit" $blocked @(0.8, 0.9, 1.3, 1.3, 0.9, 1.5, 5)
+        Add-Finding 'Medium' ([string]$blocked.Count + " requête(s) bloquée(s) pendant l'audit") ('Attente la plus longue : ' + (Format-N1 $blocked[0].'Attente (s)') + ' s, bloquée par la session ' + $blocked[0].'Bloquée par' + '.') "Identifier la session en tête de chaîne et ce qu'elle fait ; rechercher les transactions longues et les index manquants sur les tables concernées."
     } else {
-        Add-Note 'No blocking at the time of the audit.'
+        Add-Note "Aucun blocage au moment de l'audit."
     }
     if ($longTx.Count -gt 0) {
-        Add-Table 'Transactions open for more than 10 minutes' $longTx @(0.8, 1.6, 2.2, 1, 1.5, 0.9)
-        $sleeping = @($longTx | Where-Object { $_.Status -eq 'sleeping' })
-        $detail = 'Oldest open for ' + (Format-N0 $longTx[0].'Open (min)') + ' minutes (session ' + $longTx[0].Session + ', ' + $longTx[0].Program + ').'
-        if ($sleeping.Count -gt 0) { $detail += ' ' + $sleeping.Count + ' of them are idle (sleeping) with an open transaction, which usually means the application forgot to commit.' }
-        Add-Finding 'Medium' ([string]$longTx.Count + ' long-running open transaction(s)') ($detail + ' Long transactions hold locks and prevent log reuse.') 'Check with the application owner; fix missing COMMIT/ROLLBACK handling.'
+        Add-Table 'Transactions ouvertes depuis plus de 10 minutes' $longTx @(0.8, 1.6, 2.2, 1, 1.5, 1.1)
+        $sleeping = @($longTx | Where-Object { $_.Statut -eq 'sleeping' })
+        $detail = 'La plus ancienne est ouverte depuis ' + (Format-N0 $longTx[0].'Ouverte depuis (min)') + ' minutes (session ' + $longTx[0].Session + ', ' + $longTx[0].Programme + ').'
+        if ($sleeping.Count -gt 0) { $detail += ' ' + $sleeping.Count + " d'entre elles sont inactives (sleeping) avec une transaction ouverte, ce qui indique généralement une application qui a oublié de valider." }
+        Add-Finding 'Medium' ([string]$longTx.Count + ' transaction(s) ouverte(s) depuis longtemps') ($detail + " Les transactions longues conservent leurs verrous et empêchent la réutilisation du journal.") "Voir avec le responsable de l'application ; corriger la gestion des COMMIT/ROLLBACK manquants."
     }
     $c = $script:Ctx.Counters
     if ($c.ContainsKey('Number of Deadlocks/sec') -and [double]$script:Ctx.UptimeDays -gt 0) {
         $perDay = $c['Number of Deadlocks/sec'] / [math]::Max(1, [double]$script:Ctx.UptimeDays)
         if ($perDay -ge 10) {
-            Add-Finding 'Medium' ('About ' + (Format-N0 $perDay) + ' deadlocks per day') ([string](Format-N0 $c['Number of Deadlocks/sec']) + ' deadlocks since startup. Each one kills a transaction that the application must retry.') 'Capture deadlock graphs from the system_health Extended Events session and fix the access order or indexing.'
+            Add-Finding 'Medium' ('Environ ' + (Format-N0 $perDay) + ' deadlocks par jour') ([string](Format-N0 $c['Number of Deadlocks/sec']) + " deadlocks depuis le démarrage. Chacun annule une transaction que l'application doit rejouer.") "Récupérer les graphes de deadlock dans la session Extended Events system_health et corriger l'ordre d'accès aux objets ou l'indexation."
         } elseif ($perDay -ge 1) {
-            Add-Finding 'Low' ('About ' + (Format-N1 $perDay) + ' deadlocks per day') ([string](Format-N0 $c['Number of Deadlocks/sec']) + ' deadlocks since startup.') 'Review deadlock graphs in the system_health Extended Events session.'
+            Add-Finding 'Low' ('Environ ' + (Format-N1 $perDay) + ' deadlocks par jour') ([string](Format-N0 $c['Number of Deadlocks/sec']) + ' deadlocks depuis le démarrage.') "Examiner les graphes de deadlock dans la session Extended Events system_health."
         }
     }
 }
 
 # =============================================================================
-# Minimal .docx writer (Office Open XML, no dependencies)
+# Générateur .docx minimal (Office Open XML, sans dépendance)
 # =============================================================================
 
 $script:SevStyle = @{
@@ -873,8 +879,10 @@ $script:SevStyle = @{
     Low    = @{ Fg = '1F5F99'; Bg = 'DCEBFA' }
     Info   = @{ Fg = '4B5563'; Bg = 'ECEEF1' }
 }
+# Mêmes couleurs accessibles par libellé français (pour les cellules de tableau).
+foreach ($k in @('High', 'Medium', 'Low', 'Info')) { $script:SevStyle[$script:SevLabel[$k]] = $script:SevStyle[$k] }
 $script:SevRank = @{ High = 0; Medium = 1; Low = 2; Info = 3 }
-$script:ContentWidth = 9866   # A4 width minus 1.8 cm margins, in twips
+$script:ContentWidth = 9866   # largeur A4 moins 2 x 1,8 cm de marges, en twips
 
 function ConvertTo-XmlText([string]$s) {
     if ($null -eq $s) { return '' }
@@ -965,10 +973,10 @@ function Add-WTable($Rows, [double[]]$Weights, [string]$SeverityColumn) {
 
 function Add-WFinding($F) {
     $st = $script:SevStyle[$F.Severity]
-    $runs = (New-WRun ('[' + $F.Severity + ']  ') -Bold -Color $st.Fg) + (New-WRun $F.Title -Bold)
+    $runs = (New-WRun ('[' + $script:SevLabel[$F.Severity] + ']  ') -Bold -Color $st.Fg) + (New-WRun $F.Title -Bold)
     Add-WXml (New-WPara $runs -After 20 -Indent 120)
     if ($F.Detail) { Add-WXml (New-WPara (New-WRun $F.Detail) -After 20 -Indent 360) }
-    if ($F.Fix) { Add-WXml (New-WPara ((New-WRun 'What to do: ' -Bold -Color '1F3A5F') + (New-WRun $F.Fix)) -After 140 -Indent 360) }
+    if ($F.Fix) { Add-WXml (New-WPara ((New-WRun 'Que faire : ' -Bold -Color '1F3A5F') + (New-WRun $F.Fix)) -After 140 -Indent 360) }
 }
 
 function Save-Docx([string]$Path, [string]$Title) {
@@ -995,7 +1003,7 @@ function Save-Docx([string]$Path, [string]$Title) {
         '</Relationships>'
 
     $styles = $hdr + '<w:styles ' + $ns + '>' +
-        '<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Calibri" w:cs="Calibri"/><w:sz w:val="20"/><w:szCs w:val="20"/><w:lang w:val="en-US"/></w:rPr></w:rPrDefault>' +
+        '<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Calibri" w:cs="Calibri"/><w:sz w:val="20"/><w:szCs w:val="20"/><w:lang w:val="fr-FR"/></w:rPr></w:rPrDefault>' +
         '<w:pPrDefault><w:pPr><w:spacing w:after="100" w:line="264" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults>' +
         '<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style>' +
         '<w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/><w:pPr><w:spacing w:before="0" w:after="60"/></w:pPr><w:rPr><w:b/><w:color w:val="1F3A5F"/><w:sz w:val="48"/><w:szCs w:val="48"/></w:rPr></w:style>' +
@@ -1008,7 +1016,7 @@ function Save-Docx([string]$Path, [string]$Title) {
     $footer = $hdr + '<w:ftr ' + $ns + '><w:p><w:pPr><w:pStyle w:val="Footer"/><w:jc w:val="right"/></w:pPr>' +
         (New-WRun ($Title + '   |   Page ')) +
         '<w:fldSimple w:instr=" PAGE "><w:r><w:t>1</w:t></w:r></w:fldSimple>' +
-        (New-WRun ' of ') +
+        (New-WRun ' sur ') +
         '<w:fldSimple w:instr=" NUMPAGES "><w:r><w:t>1</w:t></w:r></w:fldSimple></w:p></w:ftr>'
 
     $created = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', $script:Inv)
@@ -1046,7 +1054,7 @@ function Save-Docx([string]$Path, [string]$Title) {
 }
 
 # =============================================================================
-# Report layout
+# Mise en page du rapport
 # =============================================================================
 
 function Write-Report([string]$Path, [datetime]$Started) {
@@ -1057,69 +1065,69 @@ function Write-Report([string]$Path, [datetime]$Started) {
     $cnt = @{ High = 0; Medium = 0; Low = 0; Info = 0 }
     foreach ($f in $findings) { $cnt[$f.Severity]++ }
 
-    # --- Title block
-    Add-WXml (New-WPara (New-WRun 'SQL Server Performance Audit') -Style 'Title')
+    # --- En-tête
+    Add-WXml (New-WPara (New-WRun 'Audit de performance SQL Server') -Style 'Title')
     Add-WXml (New-WPara (New-WRun $server -Bold -Color '2E5C8A' -Size 28) -After 200)
     $facts = @(
-        [pscustomobject]@{ Item = 'Version';       Value = $ctx.Version },
-        [pscustomobject]@{ Item = 'Edition';       Value = $ctx.Edition },
-        [pscustomobject]@{ Item = 'Audit date';    Value = $Started.ToString('yyyy-MM-dd HH:mm', $script:Inv) },
-        [pscustomobject]@{ Item = 'Running since'; Value = $(if ($ctx.StartTime) { (Format-Value $ctx.StartTime) + ' (' + (Format-N1 $ctx.UptimeDays) + ' days)' } else { '' }) },
-        [pscustomobject]@{ Item = 'Audited as';    Value = $ctx.AuditLogin }
+        [pscustomobject]@{ 'Élément' = 'Version';           'Valeur' = $ctx.Version },
+        [pscustomobject]@{ 'Élément' = 'Édition';           'Valeur' = $ctx.Edition },
+        [pscustomobject]@{ 'Élément' = "Date de l'audit";   'Valeur' = (Format-Date $Started) },
+        [pscustomobject]@{ 'Élément' = 'En service depuis'; 'Valeur' = $(if ($ctx.StartTime) { (Format-Date $ctx.StartTime) + ' (' + (Format-N1 $ctx.UptimeDays) + ' jours)' } else { '' }) },
+        [pscustomobject]@{ 'Élément' = 'Compte utilisé';    'Valeur' = $ctx.AuditLogin }
     )
     Add-WTable $facts @(1, 3)
 
-    # --- Summary
-    Add-WXml (New-WPara (New-WRun 'Summary') -Style 'Heading1')
+    # --- Synthèse
+    Add-WXml (New-WPara (New-WRun 'Synthèse') -Style 'Heading1')
     if ($cnt.High -gt 0) {
-        $verdict = 'There are ' + $cnt.High + ' high-severity problem(s) that deserve attention soon.'
+        $verdict = 'Il y a ' + $cnt.High + ' problème(s) de gravité élevée qui méritent une attention rapide.'
     } elseif ($cnt.Medium -gt 0) {
-        $verdict = 'No critical problems were found, but ' + $cnt.Medium + ' medium-severity issue(s) are worth looking at.'
+        $verdict = 'Aucun problème critique, mais ' + $cnt.Medium + " point(s) de gravité moyenne méritent d'être examinés."
     } elseif ($cnt.Low -gt 0) {
-        $verdict = 'The instance looks healthy; only minor improvements were found.'
+        $verdict = "L'instance semble en bonne santé ; seules des améliorations mineures ont été relevées."
     } else {
-        $verdict = 'No problems were found above the thresholds used by this audit.'
+        $verdict = "Aucun problème n'a été détecté au-delà des seuils utilisés par cet audit."
     }
     Add-WXml (New-WPara (New-WRun $verdict -Bold) -After 120)
     $summary = @(
-        [pscustomobject]@{ 'Severity' = 'High';   'Count' = $cnt.High;   'Meaning' = 'Likely hurting performance or stability now - act soon.' },
-        [pscustomobject]@{ 'Severity' = 'Medium'; 'Count' = $cnt.Medium; 'Meaning' = 'A real problem or risk worth fixing.' },
-        [pscustomobject]@{ 'Severity' = 'Low';    'Count' = $cnt.Low;    'Meaning' = 'Best-practice improvement.' },
-        [pscustomobject]@{ 'Severity' = 'Info';   'Count' = $cnt.Info;   'Meaning' = 'Context, no action required.' }
+        [pscustomobject]@{ 'Gravité' = $script:SevLabel['High'];   'Nombre' = $cnt.High;   'Signification' = 'Pénalise probablement déjà les performances ou la stabilité : agir rapidement.' },
+        [pscustomobject]@{ 'Gravité' = $script:SevLabel['Medium']; 'Nombre' = $cnt.Medium; 'Signification' = 'Vrai problème ou risque à corriger.' },
+        [pscustomobject]@{ 'Gravité' = $script:SevLabel['Low'];    'Nombre' = $cnt.Low;    'Signification' = 'Amélioration de bonne pratique.' },
+        [pscustomobject]@{ 'Gravité' = $script:SevLabel['Info'];   'Nombre' = $cnt.Info;   'Signification' = 'Contexte, aucune action nécessaire.' }
     )
-    Add-WTable $summary @(1, 0.7, 6) -SeverityColumn 'Severity'
+    Add-WTable $summary @(1, 0.7, 6) -SeverityColumn 'Gravité'
 
     if ($findings.Count -gt 0) {
-        Add-WXml (New-WPara (New-WRun 'All findings, most important first') -Style 'Heading2')
+        Add-WXml (New-WPara (New-WRun 'Tous les constats, du plus important au moins important') -Style 'Heading2')
         $i = 0
         $rows = foreach ($f in $findings) {
             $i++
             $cell = @{ Xml = ('<w:p><w:pPr><w:spacing w:before="0" w:after="0"/></w:pPr>' + (New-WRun $f.Title -Bold -Size 16) + '</w:p>' +
                               '<w:p><w:pPr><w:spacing w:before="0" w:after="0"/></w:pPr>' + (New-WRun $f.Detail -Size 16) + '</w:p>') }
-            [pscustomobject]@{ '#' = $i; 'Severity' = $f.Severity; 'Area' = $f.Area; 'Finding' = $cell; 'What to do' = $f.Fix }
+            [pscustomobject]@{ '#' = $i; 'Gravité' = $script:SevLabel[$f.Severity]; 'Domaine' = $f.Area; 'Constat' = $cell; 'Que faire' = $f.Fix }
         }
-        Add-WTable $rows @(0.4, 0.9, 1.3, 4.5, 3.4) -SeverityColumn 'Severity'
+        Add-WTable $rows @(0.4, 0.9, 1.3, 4.5, 3.4) -SeverityColumn 'Gravité'
     }
 
-    # --- Detail sections
+    # --- Sections détaillées
     $n = 0
     foreach ($s in $script:Sections) {
         $n++
         Add-WXml (New-WPara (New-WRun ([string]$n + '. ' + $s.Title)) -Style 'Heading1')
         if ($s.Intro) { Add-WXml (New-WPara (New-WRun $s.Intro -Italic -Color '4B5563') -After 120) }
         if ($s.Error) {
-            Add-WXml (New-WPara (New-WRun ('This check could not run: ' + $s.Error) -Color '9A5B00') -Shade 'FDEBC8' -After 120)
+            Add-WXml (New-WPara (New-WRun ("Cette vérification n'a pas pu s'exécuter : " + $s.Error) -Color '9A5B00') -Shade 'FDEBC8' -After 120)
         }
         $secFindings = @($findings | Where-Object { $_.Area -eq $s.Title })
         foreach ($f in $secFindings) { Add-WFinding $f }
         if (-not $s.Error -and $secFindings.Count -eq 0) {
-            Add-WXml (New-WPara (New-WRun 'No problems found in this area.' -Color '2E7D32') -After 120)
+            Add-WXml (New-WPara (New-WRun 'Aucun problème détecté dans ce domaine.' -Color '2E7D32') -After 120)
         }
         foreach ($note in $s.Notes) { Add-WXml (New-WPara (New-WRun $note -Italic -Color '6B7280' -Size 18) -After 100) }
         foreach ($t in $s.Tables) {
             Add-WXml (New-WPara (New-WRun $t.Caption) -Style 'Heading2')
             if ($t.Rows.Count -eq 0) {
-                Add-WXml (New-WPara (New-WRun 'None.' -Italic -Color '6B7280') -After 120)
+                Add-WXml (New-WPara (New-WRun 'Aucun.' -Italic -Color '6B7280') -After 120)
             } else {
                 Add-WTable $t.Rows $t.Weights
             }
@@ -1127,21 +1135,21 @@ function Write-Report([string]$Path, [datetime]$Started) {
         }
     }
 
-    # --- About
-    Add-WXml (New-WPara (New-WRun 'About this report') -Style 'Heading1')
+    # --- À propos
+    Add-WXml (New-WPara (New-WRun 'À propos de ce rapport') -Style 'Heading1')
     $about = @(
-        'This audit is read-only: it only queries system views and changes nothing on the server.',
-        'Most figures (waits, I/O, query statistics, deadlocks) accumulate since the last restart. Values such as page life expectancy, blocking and open transactions are a snapshot taken at the time of the audit.',
-        'Thresholds are common industry guidelines, not hard rules. A finding means "worth looking at", and the context (application, time of day, maintenance jobs) decides whether action is needed. Test changes before applying them in production.',
-        ('Generated by Invoke-SqlPerfAudit.ps1 version ' + $script:ScriptVersion + ' in ' + (Format-N0 ((Get-Date) - $Started).TotalSeconds) + ' seconds.')
+        "Cet audit est en lecture seule : il interroge uniquement des vues système et ne modifie rien sur le serveur.",
+        "La plupart des chiffres (attentes, E/S, statistiques de requêtes, deadlocks) sont cumulés depuis le dernier redémarrage. D'autres, comme la page life expectancy, les blocages et les transactions ouvertes, sont des instantanés pris au moment de l'audit.",
+        "Les seuils utilisés sont des repères courants, pas des règles absolues. Un constat signifie « à examiner » : le contexte (application, heure de la journée, travaux de maintenance) décide si une action est nécessaire. Testez toute modification avant de l'appliquer en production.",
+        ('Généré par Invoke-SqlPerfAudit.ps1 version ' + $script:ScriptVersion + ' en ' + (Format-N0 ((Get-Date) - $Started).TotalSeconds) + ' secondes.')
     )
     foreach ($a in $about) { Add-WXml (New-WPara (New-WRun $a -Size 18) -After 80) }
 
-    Save-Docx $Path ('SQL Server Performance Audit - ' + $server)
+    Save-Docx $Path ('Audit de performance SQL Server - ' + $server)
 }
 
 # =============================================================================
-# Main
+# Programme principal
 # =============================================================================
 
 function Invoke-InstanceAudit([string]$Instance) {
@@ -1150,23 +1158,23 @@ function Invoke-InstanceAudit([string]$Instance) {
     $script:Findings = New-Object System.Collections.ArrayList
     $script:Sections = New-Object System.Collections.ArrayList
 
-    Write-Host ('Auditing ' + $Instance + ' ...') -ForegroundColor Cyan
+    Write-Host ('Audit de ' + $Instance + ' ...') -ForegroundColor Cyan
     $script:Conn = Connect-Instance $Instance
     try {
         [void](Invoke-Q 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 10000; SET DEADLOCK_PRIORITY LOW;')
-        try { $script:Ctx.Counters = Get-PerfCounters } catch { Write-Warning ('Performance counters unavailable: ' + (Get-ShortError $_)) }
+        try { $script:Ctx.Counters = Get-PerfCounters } catch { Write-Warning ('Compteurs de performance indisponibles : ' + (Get-ShortError $_)) }
 
-        Invoke-Check 'Instance' 'Version, hardware seen by SQL Server, uptime and service settings.' { Test-Instance }
-        Invoke-Check 'Server configuration' 'Server-wide settings that most often cause performance problems when left at defaults.' { Test-Configuration }
-        Invoke-Check 'Wait statistics' 'What SQL Server spends its time waiting on since the last restart. The top waits point to the main bottleneck.' { Test-Waits }
-        Invoke-Check 'CPU' 'CPU usage over roughly the last four hours, from the SQL Server ring buffer.' { Test-Cpu }
-        Invoke-Check 'Memory' 'Memory available to the OS and to SQL Server, and signs of memory pressure.' { Test-Memory }
-        Invoke-Check 'Storage latency' 'Average read and write latency per database file since the last restart.' { Test-Io }
-        Invoke-Check 'TempDB' 'TempDB file layout, a frequent source of contention.' { Test-TempDb }
-        Invoke-Check 'Databases' 'Database options, file growth settings, log backups and virtual log files.' { Test-Databases }
-        Invoke-Check 'Top queries' 'The statements that consumed the most CPU, from the plan cache.' { Test-TopQueries }
-        Invoke-Check 'Missing indexes' 'Indexes the query optimizer reported it would have used.' { Test-MissingIndexes }
-        Invoke-Check 'Blocking and transactions' 'Blocking, long open transactions and deadlocks.' { Test-Blocking }
+        Invoke-Check 'Instance' "Version, matériel vu par SQL Server, durée de fonctionnement et paramètres du service." { Test-Instance }
+        Invoke-Check 'Configuration du serveur' "Paramètres globaux qui causent le plus souvent des problèmes de performance lorsqu'ils sont laissés par défaut." { Test-Configuration }
+        Invoke-Check "Statistiques d'attente" "Ce que SQL Server passe son temps à attendre depuis le dernier redémarrage. Les principales attentes désignent le goulet d'étranglement." { Test-Waits }
+        Invoke-Check 'Processeur' "Utilisation du processeur sur environ les quatre dernières heures, d'après le ring buffer de SQL Server." { Test-Cpu }
+        Invoke-Check 'Mémoire' "Mémoire disponible pour le système et pour SQL Server, et signes de pression mémoire." { Test-Memory }
+        Invoke-Check 'Latence du stockage' "Latence moyenne de lecture et d'écriture par fichier de base depuis le dernier redémarrage." { Test-Io }
+        Invoke-Check 'TempDB' "Organisation des fichiers de TempDB, source fréquente de contention." { Test-TempDb }
+        Invoke-Check 'Bases de données' "Options des bases, paramètres de croissance des fichiers, sauvegardes du journal et fichiers journaux virtuels." { Test-Databases }
+        Invoke-Check 'Requêtes les plus coûteuses' "Les instructions qui ont consommé le plus de CPU, d'après le cache de plans." { Test-TopQueries }
+        Invoke-Check 'Index manquants' "Index que l'optimiseur de requêtes aurait voulu utiliser." { Test-MissingIndexes }
+        Invoke-Check 'Blocages et transactions' "Blocages, transactions ouvertes depuis longtemps et deadlocks." { Test-Blocking }
     } finally {
         $script:Conn.Close()
         $script:Conn.Dispose()
@@ -1178,20 +1186,20 @@ function Invoke-InstanceAudit([string]$Instance) {
     if (-not (Test-Path -LiteralPath $OutputFolder)) { [void](New-Item -ItemType Directory -Path $OutputFolder) }
     $folder = (Resolve-Path -LiteralPath $OutputFolder).ProviderPath
     $safe = $Instance -replace '[\\/:*?"<>|,]', '_'
-    $file = Join-Path $folder ('SQLPerfAudit_' + $safe + '_' + $started.ToString('yyyyMMdd_HHmm') + '.docx')
+    $file = Join-Path $folder ('SQLPerfAudit_' + $safe + '_' + $started.ToString('yyyyMMdd_HHmm', $script:Inv) + '.docx')
     Write-Report $file $started
 
     $cnt = @{ High = 0; Medium = 0; Low = 0; Info = 0 }
     foreach ($f in $script:Findings) { $cnt[$f.Severity]++ }
-    Write-Host ('  Report: ' + $file) -ForegroundColor Green
-    Write-Host ('  Findings: ' + $cnt.High + ' high, ' + $cnt.Medium + ' medium, ' + $cnt.Low + ' low, ' + $cnt.Info + ' info') -ForegroundColor Green
-    [pscustomobject]@{ Instance = $Instance; Report = $file; High = $cnt.High; Medium = $cnt.Medium; Low = $cnt.Low; Info = $cnt.Info }
+    Write-Host ('  Rapport : ' + $file) -ForegroundColor Green
+    Write-Host ('  Constats : ' + $cnt.High + ' élevée(s), ' + $cnt.Medium + ' moyenne(s), ' + $cnt.Low + ' faible(s), ' + $cnt.Info + ' info') -ForegroundColor Green
+    [pscustomobject]@{ 'Instance' = $Instance; 'Rapport' = $file; 'Élevée' = $cnt.High; 'Moyenne' = $cnt.Medium; 'Faible' = $cnt.Low; 'Info' = $cnt.Info }
 }
 
 foreach ($inst in $SqlInstance) {
     try {
         Invoke-InstanceAudit $inst
     } catch {
-        Write-Warning ('Audit of ' + $inst + ' failed: ' + (Get-ShortError $_))
+        Write-Warning ("L'audit de " + $inst + ' a échoué : ' + (Get-ShortError $_))
     }
 }
